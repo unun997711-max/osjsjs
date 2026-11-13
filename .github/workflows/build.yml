@@ -1,0 +1,2424 @@
+name: Build Pixel Rift APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write game files
+        run: |
+          mkdir -p game
+          cat > game/buildozer.spec << 'EOF'
+          [app]
+          title = Pixel Rift
+          package.name = pixelrift
+          package.domain = org.pixel
+          source.dir = .
+          source.include_exts = py,png
+          version = 1.0
+          requirements = python3,kivy==2.3.0
+          orientation = landscape
+          fullscreen = 1
+          android.permissions = INTERNET,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,CHANGE_WIFI_MULTICAST_STATE
+          android.api = 33
+          android.minapi = 24
+          android.archs = arm64-v8a
+          android.accept_sdk_license = True
+
+          [buildozer]
+          log_level = 2
+          warn_on_root = 0
+          EOF
+
+          cat > game/main.py << 'EOF'
+          # ===================== PIXEL RIFT - main.py =====================
+          # ---------- PART 1: core + pixel-art engine + heroes ----------
+          import socket, threading, json, time, random, math
+          from kivy.app import App
+          from kivy.uix.widget import Widget
+          from kivy.core.window import Window
+          from kivy.graphics.texture import Texture
+          from kivy.graphics import Color, Rectangle, PushMatrix, PopMatrix, Scale, Translate
+          from kivy.clock import Clock
+          from kivy.config import Config
+
+          PORT = 45454          # LAN port used by host
+          TILE = 16             # pixel size of one tile
+          VIEW_W, VIEW_H = 320, 180   # internal pixel resolution (scaled up)
+          GRAVITY = 900.0
+          MAX_PLAYERS = 4
+
+          # ---------- palette helpers ----------
+          def rgba(hexs, a=255):
+              hexs = hexs.lstrip('#')
+              return (int(hexs[0:2], 16), int(hexs[2:4], 16), int(hexs[4:6], 16), a)
+
+          # ---------- sprite -> texture ----------
+          def make_tex(rows, pal, mirror=False):
+              """rows: list of equal-length strings. pal: char -> (r,g,b,a). '.' = transparent."""
+              h = len(rows)
+              w = len(rows[0])
+              buf = bytearray()
+              for r in reversed(rows):          # Kivy textures start at bottom-left
+                  if mirror:
+                      r = r[::-1]
+                  for ch in r:
+                      c = pal.get(ch)
+                      buf += bytes(c) if c else b'\x00\x00\x00\x00'
+              t = Texture.create(size=(w, h), colorfmt='rgba')
+              t.blit_buffer(bytes(buf), colorfmt='rgba', bufferfmt='ubyte')
+              t.mag_filter = 'nearest'
+              t.min_filter = 'nearest'
+              return t
+
+          # ---------- hero sprite data (12 x 16) ----------
+          # K outline, H hair, S skin, E eye, A armor, B armor dark, L legs
+          HERO_BODY = [
+              "....KKKK....",
+              "...KHHHHK...",
+              "..KHHHHHHK..",
+              "..KHSSSSHK..",
+              "..KSESSESK..",
+              "...KSSSSK...",
+              "....KSSK....",
+              "..KAAAAAAK..",
+              ".KAAABBAAAK.",
+              ".KSAABBAASK.",
+              ".KSAAAAAASK.",
+              "..KBBBBBBK..",
+          ]
+          HERO_LEGS = {
+              'idle': ["..KLLKKLLK..", "..KLL..LLK..", "..KLL..LLK..", "..KKK..KKK.."],
+              'run1': ["..KLLKKLLK..", ".KLLK..KLLK.", ".KLK....KLK.", ".KKK....KKK."],
+              'run2': ["..KLLKKLLK..", "..KLK..KLK..", "...KLK.KLK..", "...KKK.KKK.."],
+          }
+
+          # one style per player slot: (armor, armor dark, hair, legs)
+          PLAYER_STYLES = [
+              ('#3fb8c9', '#1f6f86', '#c9c9d6', '#3a3a5a'),   # P1 teal wizard
+              ('#7fd23a', '#3f7d1e', '#2b2b2b', '#4a3a22'),   # P2 green hood
+              ('#e0453c', '#8c1f2a', '#f08a2c', '#4a2a2a'),   # P3 red/orange
+              ('#a53fd0', '#5a1f86', '#1a1a24', '#2a2a44'),   # P4 purple
+          ]
+
+          SPR = {}      # name -> Texture   (filled by build_sprites after GL is ready)
+
+          def hero_palette(slot):
+              a, b, h, l = PLAYER_STYLES[slot % 4]
+              return {
+                  'K': rgba('#14101e'), 'H': rgba(h), 'S': rgba('#f1c7a0'),
+                  'E': rgba('#101018'), 'A': rgba(a), 'B': rgba(b), 'L': rgba(l),
+              }
+
+          def build_hero_sprites():
+              for slot in range(MAX_PLAYERS):
+                  pal = hero_palette(slot)
+                  for state, legs in HERO_LEGS.items():
+                      rows = HERO_BODY + legs
+                      SPR['hero%d_%s_R' % (slot, state)] = make_tex(rows, pal)
+                      SPR['hero%d_%s_L' % (slot, state)] = make_tex(rows, pal, mirror=True)
+
+          def build_sprites():
+              build_hero_sprites()
+              # PART 2 will add: build_world_sprites(), build_enemy_sprites(), build_boss_sprites()
+
+          # ---------- (PART 2 continues below) ----------
+          # ===================== PART 2: world, enemies, boss, backgrounds =====================
+
+          class Px:
+              """pixel canvas: draw chars into a grid, then convert with make_tex"""
+              def __init__(s, w, h):
+                  s.w, s.h = w, h
+                  s.g = [['.'] * w for _ in range(h)]
+              def p(s, x, y, c):
+                  if 0 <= x < s.w and 0 <= y < s.h:
+                      s.g[y][x] = c
+              def disc(s, cx, cy, r, c):
+                  for y in range(cy - r, cy + r + 1):
+                      for x in range(cx - r, cx + r + 1):
+                          if (x - cx) ** 2 + (y - cy) ** 2 <= r * r + r:
+                              s.p(x, y, c)
+              def line(s, x0, y0, x1, y1, c, t=1):
+                  n = max(abs(x1 - x0), abs(y1 - y0), 1)
+                  for i in range(n + 1):
+                      x = x0 + int(round((x1 - x0) * i / n))
+                      y = y0 + int(round((y1 - y0) * i / n))
+                      for ox in range(t):
+                          for oy in range(t):
+                              s.p(x + ox, y + oy, c)
+              def shade(s, mp):
+                  """top edge -> highlight char, bottom edge -> shadow char"""
+                  src = [r[:] for r in s.g]
+                  for y in range(s.h):
+                      for x in range(s.w):
+                          c = src[y][x]
+                          if c in mp:
+                              up = src[y - 1][x] if y > 0 else '.'
+                              dn = src[y + 1][x] if y < s.h - 1 else '.'
+                              if up == '.':
+                                  s.g[y][x] = mp[c][0]
+                              elif dn == '.':
+                                  s.g[y][x] = mp[c][1]
+              def outline(s, c='K'):
+                  src = [r[:] for r in s.g]
+                  for y in range(s.h):
+                      for x in range(s.w):
+                          if src[y][x] != '.':
+                              continue
+                          for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                              nx, ny = x + dx, y + dy
+                              if 0 <= nx < s.w and 0 <= ny < s.h and src[ny][nx] != '.':
+                                  s.g[y][x] = c
+                                  break
+              def rows(s):
+                  return [''.join(r) for r in s.g]
+
+          # ---------- ground tiles (16x16 pixel rock + glowing moss) ----------
+          TILE_PAL = {
+              'a': rgba('#5a2e3a'), 'b': rgba('#3d1f2e'), 'c': rgba('#7a4150'),
+              'd': rgba('#2a1424'), 'g': rgba('#2e8a5a'), 'h': rgba('#58e09a'),
+              'i': rgba('#1b5a48'), 'm': rgba('#7affc8'),
+          }
+
+          def gen_tile(kind, seed):
+              rnd = random.Random(seed)
+              rows = []
+              for y in range(TILE):
+                  row = ''
+                  for x in range(TILE):
+                      r = rnd.random()
+                      rock = 'a' if r < 0.55 else 'c' if r < 0.68 else 'b' if r < 0.9 else 'd'
+                      if rnd.random() < 0.015:
+                          rock = 'm'
+                      if kind == 'G':                       # grass top
+                          if y == 0:
+                              c = 'h' if r < 0.5 else '.'
+                          elif y < 3:
+                              c = 'g' if r < 0.7 else 'i'
+                          elif y == 3:
+                              c = 'i' if r < 0.6 else rock
+                          else:
+                              c = rock
+                      elif kind == 'P':                     # stone platform
+                          if y == 0:
+                              c = 'c'
+                          elif y == TILE - 1:
+                              c = 'd'
+                          elif x in (0, TILE - 1):
+                              c = 'b'
+                          else:
+                              c = rock
+                      else:                                 # plain rock
+                          c = rock
+                      row += c
+                  rows.append(row)
+              return rows
+
+          # ---------- small props ----------
+          FLOWER = [
+              ".KPPPK.",
+              "KPPWPPK",
+              ".KPPPK.",
+              "..KGK..",
+              "..KGK..",
+              ".KGKGK.",
+              "KGK.KGK",
+          ]
+          FLOWER_PAL = {'K': rgba('#14101e'), 'P': rgba('#ff6ad5'),
+                        'W': rgba('#fff0fa'), 'G': rgba('#2e8a5a')}
+
+          MUSH = [
+              "..KKKK..",
+              ".KCCCCK.",
+              "KCCWCCCK",
+              "KCCCCCCK",
+              "KKKSSKKK",
+              "...KSSK.",
+              "...KSSK.",
+              "..KKSSKK",
+          ]
+          MUSH_PAL = {'K': rgba('#14101e'), 'C': rgba('#3ac8ff'),
+                      'W': rgba('#d8f6ff'), 'S': rgba('#c8b8d8')}
+
+          ORB = [
+              ".PPP.",
+              "PWWWP",
+              "PWWWP",
+              "PWWWP",
+              ".PPP.",
+          ]
+
+          def make_glow(size, rgb, levels=4):
+              """soft light, quantized to a few alpha steps so it stays pixelated"""
+              buf = bytearray()
+              c = (size - 1) / 2.0
+              for y in range(size):
+                  for x in range(size):
+                      d = math.hypot(x - c, y - c) / c
+                      lv = 0 if d >= 1 else int((1 - d) * levels)
+                      buf += bytes((rgb[0], rgb[1], rgb[2], min(255, lv * 55)))
+              t = Texture.create(size=(size, size), colorfmt='rgba')
+              t.blit_buffer(bytes(buf), colorfmt='rgba', bufferfmt='ubyte')
+              t.mag_filter = 'nearest'
+              t.min_filter = 'nearest'
+              return t
+
+          # ---------- boss palette (tree guardian) ----------
+          BOSS_PAL = {
+              'K': rgba('#1a0a10'), 'O': rgba('#b8582a'), 'o': rgba('#6e2c1e'),
+              'q': rgba('#e8943f'), 'B': rgba('#d0642c'), 'F': rgba('#1f4a3a'),
+              'f': rgba('#10282a'), 'g': rgba('#34885a'), 'Y': rgba('#ffd84a'),
+              'W': rgba('#f6f2e4'), 'k': rgba('#2a0a12'),
+          }
+
+          def build_boss_sprites():
+              rnd = random.Random(11)
+              px = Px(56, 56)
+              # roots
+              for x0, x1 in ((14, 5), (22, 17), (31, 36), (39, 50)):
+                  px.line(x0, 46, x1, 54, 'O', 3)
+              # trunk
+              for y in range(26, 50):
+                  half = 9 + (y - 26) // 3
+                  for x in range(28 - half, 28 + half + 1):
+                      px.p(x, y, 'O')
+              # leafy mane behind the head
+              px.disc(30, 16, 13, 'F')
+              px.disc(20, 14, 9, 'F')
+              px.disc(40, 20, 8, 'F')
+              for _ in range(220):
+                  x, y = rnd.randint(6, 52), rnd.randint(1, 32)
+                  if px.g[y][x] == 'F':
+                      px.p(x, y, rnd.choice('fgf'))
+              # face
+              px.disc(22, 22, 8, 'O')
+              px.line(16, 18, 20, 19, 'o', 1)
+              px.line(27, 18, 23, 19, 'o', 1)
+              for ex in (18, 19, 24, 25):
+                  px.p(ex, 20, 'Y')
+              px.line(18, 27, 26, 27, 'k', 1)
+              px.p(20, 26, 'W'); px.p(24, 26, 'W')
+              # horn
+              px.line(18, 13, 12, 6, 'W', 2)
+              px.p(11, 5, 'W')
+              # arms with twig fingers
+              px.line(20, 32, 6, 38, 'B', 3)
+              px.line(6, 38, 2, 34, 'B', 2)
+              px.line(2, 34, 0, 30, 'B', 1)
+              px.line(4, 38, 0, 41, 'B', 1)
+              px.line(38, 32, 50, 22, 'B', 3)
+              px.line(50, 22, 54, 14, 'B', 2)
+              px.line(50, 22, 55, 25, 'B', 1)
+              px.line(52, 18, 46, 12, 'B', 1)
+              # bark texture
+              for y in range(px.h):
+                  for x in range(px.w):
+                      if px.g[y][x] in 'OB':
+                          r = rnd.random()
+                          if r < 0.10:
+                              px.g[y][x] = 'o'
+                          elif r < 0.14:
+                              px.g[y][x] = 'q'
+              px.shade({'O': ('q', 'o'), 'B': ('q', 'o'), 'F': ('g', 'f')})
+              # glowing sap cracks
+              px.line(27, 34, 27, 40, 'Y', 1)
+              px.line(33, 38, 35, 43, 'Y', 1)
+              px.line(22, 40, 20, 45, 'Y', 1)
+              px.outline('K')
+              rows = px.rows()
+              SPR['boss_L'] = make_tex(rows, BOSS_PAL)
+              SPR['boss_R'] = make_tex(rows, BOSS_PAL, mirror=True)
+              hit = {k: ((255, 255, 255, 255) if k != 'K' else v) for k, v in BOSS_PAL.items()}
+              SPR['boss_hit_L'] = make_tex(rows, hit)
+              SPR['boss_hit_R'] = make_tex(rows, hit, mirror=True)
+              # carved glowing pillar (arena decoration)
+              pl = Px(16, 64)
+              for y in range(64):
+                  for x in range(16):
+                      pl.g[y][x] = 'o' if x in (0, 1, 14, 15) else 'O'
+              for y in range(6, 64, 16):
+                  pl.line(5, y, 10, y, 'Y', 1)
+                  pl.line(7, y - 2, 7, y + 3, 'Y', 1)
+              for _ in range(60):
+                  pl.p(rnd.randint(2, 13), rnd.randint(0, 63), rnd.choice('oq'))
+              pl.outline('K')
+              SPR['pillar'] = make_tex(pl.rows(), BOSS_PAL)
+
+          # ---------- enemies ----------
+          BAT_A = [
+              "KK........KK..",
+              "KBK......KBK..",
+              "KBBK.KK.KBBK..",
+              ".KBBKBBBKBBK..",
+              "..KBBBBBBBBK..",
+              "...KBEBBEBK...",
+              "....KBBBBK....",
+              ".....KBWWBK...",
+              "......KBBK....",
+              ".....KK..KK...",
+          ]
+          BAT_B = [
+              "..............",
+              "......KK......",
+              "....KKBBKK....",
+              ".KK.KBBBBK.KK.",
+              "KBBKBEBBEBKBBK",
+              "KBBBKBBBBKBBBK",
+              ".KBBKBWWBKBBK.",
+              "..KKK.KBBK.KK.",
+              "......KBBK....",
+              ".....KK..KK...",
+          ]
+          BAT_PAL = {'K': rgba('#0c0a24'), 'B': rgba('#4a6cf0'),
+                     'E': rgba('#ffe14a'), 'W': rgba('#a8c0ff')}
+
+          BEAST_IDLE = [
+              "K..........K",
+              "KK........KK",
+              ".KKKKKKKKKK.",
+              "KKDDDDDDDDKK",
+              ".KDEDDDDEDK.",
+              ".KDDDDDDDDK.",
+              "..KDDWWDDK..",
+              "..KDDDDDDK..",
+              ".KDDDDDDDDK.",
+              ".KDDKDDKDDK.",
+              ".KDDK..KDDK.",
+              ".KKK....KKK.",
+          ]
+          BEAST_WALK = BEAST_IDLE[:10] + [
+              "..KDDKKDDK..",
+              "..KKK..KKK..",
+          ]
+          BEAST_PAL = {'K': rgba('#0c0a14'), 'D': rgba('#2a2440'),
+                       'E': rgba('#ff4a3a'), 'W': rgba('#e8e8f0')}
+
+          def build_enemy_sprites():
+              SPR['bat_0'] = make_tex(BAT_A, BAT_PAL)
+              SPR['bat_1'] = make_tex(BAT_B, BAT_PAL)
+              for nm, rows in (('idle', BEAST_IDLE), ('walk', BEAST_WALK)):
+                  SPR['beast_%s_R' % nm] = make_tex(rows, BEAST_PAL)
+                  SPR['beast_%s_L' % nm] = make_tex(rows, BEAST_PAL, mirror=True)
+
+          # ---------- backgrounds (dithered, parallax) ----------
+          BG_FAR_PAL = {
+              'a': rgba('#0c2a2e'), 'b': rgba('#10383a'), 'c': rgba('#14484a'),
+              'd': rgba('#1a5a54'), 'e': rgba('#226a5a'), 'T': rgba('#0a1e24'),
+              't': rgba('#0e2a30'), 'l': rgba('#0f3a36'), 'm': rgba('#17504a'),
+              'L': rgba('#2e8a74'),
+          }
+          BG_MID_PAL = {
+              'v': rgba('#0e3a30'), 'u': rgba('#17604a'),
+              'w': rgba('#2e9a6a'), 'V': rgba('#1a7a52'),
+          }
+
+          def build_backgrounds():
+              rnd = random.Random(5)
+              w, h = VIEW_W, VIEW_H
+              px = Px(w, h)
+              for y in range(h):
+                  t = y / float(h) * 5
+                  b0 = int(t)
+                  fr = t - b0
+                  for x in range(w):
+                      b = b0
+                      if fr > 0.75 and (x + y) % 2 == 0:
+                          b += 1
+                      elif fr > 0.4 and x % 2 == 0 and y % 2 == 0:
+                          b += 1
+                      px.g[y][x] = 'abcde'[min(b, 4)]
+              for _ in range(7):                       # far tree trunks
+                  x0, tw = rnd.randint(0, w), rnd.randint(10, 20)
+                  for y in range(h):
+                      for x in range(x0, x0 + tw):
+                          ch = 'T' if (x - x0) < tw * 0.7 else 't'
+                          if rnd.random() < 0.06:
+                              ch = 't'
+                          px.p(x, y, ch)
+              for _ in range(4):                       # dithered light shafts
+                  x0 = rnd.randint(40, 300)
+                  for y in range(h):
+                      cx = x0 + int(y * 0.35)
+                      for dx in range(-6, 7):
+                          if (cx + dx + y) % 2 == 0 and abs(dx) < 6 - (y // 60):
+                              if 0 <= cx + dx < w and px.g[y][cx + dx] in 'abcde':
+                                  px.g[y][cx + dx] = 'L'
+              for x in range(w):                       # far canopy
+                  d = 18 + int(10 * math.sin(x / 13.0)) + rnd.randint(0, 3)
+                  for y in range(d):
+                      px.p(x, y, 'l' if rnd.random() < 0.8 else 'm')
+              SPR['bg_far'] = make_tex(px.rows(), BG_FAR_PAL)
+
+              # near layer: dark canopy + hanging vines (left side, like the reference)
+              m = Px(w, h)
+              def depth(x):
+                  return int(46 * max(0.0, 1 - x / 210.0)) + 6 + int(5 * math.sin(x / 7.0))
+              for x in range(w):
+                  d = depth(x)
+                  for y in range(d):
+                      r = rnd.random()
+                      m.p(x, y, 'v' if r < 0.6 else 'u' if r < 0.9 else 'w')
+              for _ in range(22):
+                  x = rnd.randint(0, 230)
+                  d = depth(x)
+                  for y in range(d, d + rnd.randint(10, 60)):
+                      vx = x + int(2 * math.sin(y / 6.0))
+                      m.p(vx, y, 'V')
+                      if rnd.random() < 0.12:
+                          m.p(vx + 1, y, 'w')
+              SPR['bg_mid'] = make_tex(m.rows(), BG_MID_PAL)
+
+          # ---------- assemble world sprites ----------
+          def build_world_sprites():
+              for i in range(4):
+                  SPR['tile_G%d' % i] = make_tex(gen_tile('G', 100 + i), TILE_PAL)
+                  SPR['tile_D%d' % i] = make_tex(gen_tile('D', 200 + i), TILE_PAL)
+                  SPR['tile_P%d' % i] = make_tex(gen_tile('P', 300 + i), TILE_PAL)
+              SPR['flower'] = make_tex(FLOWER, FLOWER_PAL)
+              SPR['mush'] = make_tex(MUSH, MUSH_PAL)
+              for nm, col in (('pink', '#ff6ad5'), ('cyan', '#3ae0ff'),
+                              ('yellow', '#ffe14a'), ('green', '#7affc8')):
+                  r, g, b, _a = rgba(col)
+                  SPR['glow_' + nm] = make_glow(32, (r, g, b))
+                  SPR['orb_' + nm] = make_tex(ORB, {'P': rgba(col), 'W': rgba('#ffffff')})
+              build_backgrounds()
+
+          # override the placeholder from PART 1 with the full version
+          def build_sprites():
+              build_hero_sprites()
+              build_world_sprites()
+              build_enemy_sprites()
+              build_boss_sprites()
+              # PART 3 will use: SPR['tile_G0..3'], ['tile_D0..3'], ['tile_P0..3'],
+              # 'bat_0/1', 'beast_idle|walk_L|R', 'boss_L|R', 'boss_hit_L|R',
+              # 'bg_far', 'bg_mid', 'glow_*', 'orb_*', 'flower', 'mush', 'pillar'
+
+          # ---------- (PART 3 continues below) ----------
+          # ===================== PART 3: world, physics, combat =====================
+
+          LEVEL_W = 150            # level width (tiles)
+          LEVEL_H = 12             # level height (tiles)
+          ARENA_X = 112            # boss arena starts at this tile column
+          BOSS_SPAWN_X = 136 * TILE
+          SOLID = 'GDP'
+          SLOT_COL = ['cyan', 'green', 'yellow', 'pink']
+          PCOL = {'white': (255, 255, 255), 'cyan': (58, 224, 255), 'green': (122, 255, 200),
+                  'yellow': (255, 225, 74), 'pink': (255, 106, 213), 'red': (255, 70, 60),
+                  'orange': (255, 150, 50)}
+
+          def clamp(v, a, b):
+              return a if v < a else b if v > b else v
+
+          def ov(ax, ay, aw, ah, bx, by, bw, bh):
+              return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah
+
+          # ---------- tile collision ----------
+          def box_hits(e, world):
+              tx0 = int(e.x // TILE)
+              tx1 = int((e.x + e.W - 0.01) // TILE)
+              ty0 = int(e.y // TILE)
+              ty1 = int((e.y + e.H - 0.01) // TILE)
+              for ty in range(ty0, ty1 + 1):
+                  for tx in range(tx0, tx1 + 1):
+                      if world.tile_solid(tx, ty):
+                          return True
+              return False
+
+          def move_box(e, dt, world):
+              e.hit_wall = False
+              e.x += e.vx * dt
+              if box_hits(e, world):
+                  stepped = False
+                  if e.ground and getattr(e, 'step', False):
+                      e.y -= TILE
+                      if not box_hits(e, world):
+                          stepped = True
+                      else:
+                          e.y += TILE
+                  if not stepped:
+                      if e.vx > 0:
+                          e.x = int((e.x + e.W) // TILE) * TILE - e.W - 0.01
+                      elif e.vx < 0:
+                          e.x = (int(e.x // TILE) + 1) * TILE
+                      e.vx = 0.0
+                      e.hit_wall = True
+              e.y += e.vy * dt
+              e.ground = False
+              if box_hits(e, world):
+                  if e.vy > 0:
+                      e.y = int((e.y + e.H) // TILE) * TILE - e.H - 0.01
+                      e.ground = True
+                  else:
+                      e.y = (int(e.y // TILE) + 1) * TILE
+                  e.vy = 0.0
+
+          # ---------- entities ----------
+          class Player:
+              W, H = 8, 16
+              step = True
+              def __init__(s, slot, name='Hero'):
+                  s.slot, s.name = slot, name
+                  s.x, s.y = 40.0 + slot * 14, 110.0
+                  s.tx, s.ty = s.x, s.y
+                  s.vx = s.vy = 0.0
+                  s.face = 1
+                  s.ground = False
+                  s.hit_wall = False
+                  s.coyote = 0.0
+                  s.jump_buf = 0.0
+                  s.jp = False
+                  s.anim = 0.0
+                  s.hp = s.mhp = 400
+                  s.mana = 100.0
+                  s.coins = 0
+                  s.alive = True
+                  s.inv = 0.0
+                  s.cd = 0.0
+                  s.dead_t = 0.0
+                  s.own = False
+                  s.rs = 0
+                  s.skill_prev = False
+                  s.inp = {'l': False, 'r': False, 'j': False, 'a': False, 's': False}
+
+              def step_phys(s, dt, world):
+                  i = s.inp
+                  tgt = (int(i['r']) - int(i['l'])) * 92.0
+                  acc = 900.0 if s.ground else 520.0
+                  if s.vx < tgt:
+                      s.vx = min(tgt, s.vx + acc * dt)
+                  elif s.vx > tgt:
+                      s.vx = max(tgt, s.vx - acc * dt)
+                  if tgt:
+                      s.face = 1 if tgt > 0 else -1
+                  s.coyote = 0.1 if s.ground else s.coyote - dt
+                  s.jump_buf = 0.12 if (i['j'] and not s.jp) else s.jump_buf - dt
+                  s.jp = i['j']
+                  if s.jump_buf > 0 and s.coyote > 0:
+                      s.vy = -300.0
+                      s.coyote = 0.0
+                      s.jump_buf = 0.0
+                      s.ground = False
+                  if not i['j'] and s.vy < -120:
+                      s.vy += 1800 * dt                  # short hop
+                  s.vy = min(s.vy + GRAVITY * dt, 480.0)
+                  move_box(s, dt, world)
+                  s.anim += dt * abs(s.vx) / 40.0
+
+              def lerp(s, dt):
+                  k = min(1.0, dt * 14)
+                  s.x += (s.tx - s.x) * k
+                  s.y += (s.ty - s.y) * k
+                  s.anim += dt * abs(s.vx) / 40.0
+
+              def net_state(s):
+                  return [round(s.x, 1), round(s.y, 1), round(s.vx, 1), round(s.vy, 1),
+                          s.face, int(s.ground), int(s.inp['a']), int(s.inp['s']), s.rs]
+
+              def set_remote(s, d):
+                  if d[8] == s.rs:
+                      s.tx, s.ty = d[0], d[1]
+                  s.vx, s.vy, s.face, s.ground = d[2], d[3], d[4], bool(d[5])
+                  s.inp['a'] = bool(d[6])
+                  s.inp['s'] = bool(d[7])
+
+              def sprite(s):
+                  if not s.alive:
+                      return None
+                  if not s.ground:
+                      st = 'run2'
+                  elif abs(s.vx) > 8:
+                      st = 'run1' if int(s.anim * 2) % 2 == 0 else 'run2'
+                  else:
+                      st = 'idle'
+                  key = 'hero%d_%s_%s' % (s.slot, st, 'R' if s.face > 0 else 'L')
+                  return (key, s.x - 2, s.y, 12, 16)
+
+          class Enemy:
+              _n = 0
+              def __init__(s, kind, x, y, eid=None):
+                  if eid is None:
+                      Enemy._n += 1
+                      eid = Enemy._n
+                  s.id, s.kind = eid, kind
+                  s.x, s.y = float(x), float(y)
+                  s.tx, s.ty = s.x, s.y
+                  s.vx = s.vy = 0.0
+                  s.face = -1
+                  s.ground = False
+                  s.hit_wall = False
+                  s.anim = random.random() * 5
+                  s.awake = False
+                  s.alive = True
+                  s.flash = 0.0
+                  if kind == 'bat':
+                      s.W, s.H, s.hp, s.dmg, s.step = 12, 9, 260, 22, False
+                  else:
+                      s.W, s.H, s.hp, s.dmg, s.step = 11, 12, 520, 38, True
+                  s.mhp = s.hp
+
+              def update(s, dt, world):
+                  s.anim += dt
+                  s.flash = max(0.0, s.flash - dt)
+                  tgt = world.nearest_player(s.x + s.W / 2, s.y + s.H / 2)
+                  if tgt is None:
+                      return
+                  dx = (tgt.x + 4) - (s.x + s.W / 2)
+                  dy = (tgt.y + 8) - (s.y + s.H / 2)
+                  if not s.awake:
+                      if abs(dx) < 220 and abs(dy) < 140:
+                          s.awake = True
+                      else:
+                          return
+                  s.face = 1 if dx > 0 else -1
+                  if s.kind == 'bat':
+                      s.vx = clamp(s.vx + clamp(dx, -40, 40) / 40.0 * 220 * dt, -60, 60)
+                      s.vy = clamp(dy, -30, 30) / 30.0 * 35 + math.sin(s.anim * 6) * 25
+                  else:
+                      s.vx = s.face * 38.0 if abs(dx) > 3 else 0.0
+                      s.vy = min(s.vy + GRAVITY * dt, 480.0)
+                  move_box(s, dt, world)
+
+              def sprite(s):
+                  if s.kind == 'bat':
+                      return ('bat_%d' % (int(s.anim * 8) % 2), s.x - 1, s.y - 1, 14, 10)
+                  st = 'walk' if (abs(s.vx) > 1 and int(s.anim * 6) % 2 == 0) else 'idle'
+                  return ('beast_%s_%s' % (st, 'R' if s.face > 0 else 'L'), s.x - 0.5, s.y, 12, 12)
+
+          class Boss:
+              W, H = 30, 44
+              step = False
+              def __init__(s, x, y, n=1):
+                  s.x, s.y = float(x), float(y)
+                  s.tx, s.ty = s.x, s.y
+                  s.vx = s.vy = 0.0
+                  s.hp = s.mhp = 14000 * max(1, n)
+                  s.face = -1
+                  s.ground = False
+                  s.hit_wall = False
+                  s.alive = True
+                  s.awake = False
+                  s.flash = 0.0
+                  s.phase = 1
+                  s.state = 'idle'
+                  s.t = 1.0
+                  s.anim = 0.0
+
+              def update(s, dt, world):
+                  s.anim += dt
+                  s.flash = max(0.0, s.flash - dt)
+                  if not s.awake or not s.alive:
+                      return
+                  tgt = world.nearest_player(s.x + 15, s.y + 22)
+                  if s.phase == 1 and s.hp < s.mhp * 0.5:
+                      s.phase = 2
+                      world.emit_event('boss_phase2')
+                  s.t -= dt * (1.0 if s.phase == 1 else 1.4)
+                  s.vy = min(s.vy + GRAVITY * dt, 480.0)
+                  if s.state == 'idle':
+                      s.vx = 0.0
+                      if tgt:
+                          s.face = 1 if tgt.x + 4 > s.x + 15 else -1
+                      if s.t <= 0:
+                          s.state = random.choice(['walk', 'slam', 'leaves', 'roots', 'slam'])
+                          s.t = {'walk': 1.5, 'slam': 0.8, 'leaves': 0.9, 'roots': 0.7}[s.state]
+                  elif s.state == 'walk':
+                      s.vx = s.face * 34.0
+                      if s.hit_wall:
+                          s.face = -s.face
+                      if s.t <= 0:
+                          s.state, s.t = 'idle', 0.6
+                  else:
+                      s.vx = 0.0
+                      if s.t <= 0:
+                          if s.state == 'slam':
+                              world.boss_slam(s)
+                          elif s.state == 'leaves':
+                              world.boss_leaves(s, tgt)
+                          elif s.state == 'roots':
+                              world.boss_roots(s)
+                          s.state, s.t = 'idle', 0.9
+                  move_box(s, dt, world)
+
+              def sprite(s):
+                  if not s.alive:
+                      return None
+                  key = ('boss_hit_' if s.flash > 0 else 'boss_') + ('R' if s.face > 0 else 'L')
+                  yo = -4 if (s.state == 'slam' and s.t > 0.3) else 0
+                  return (key, s.x - 13, s.y - 12 + yo, 56, 56)
+
+          class Shot:
+              def __init__(s, x, y, vx, vy, dmg, team, owner, color, life,
+                           grav=0.0, size=1, kind='bolt', crit=False):
+                  s.x, s.y, s.vx, s.vy = x, y, vx, vy
+                  s.dmg, s.team, s.owner, s.color = dmg, team, owner, color
+                  s.life, s.grav, s.size, s.kind, s.crit = life, grav, size, kind, crit
+                  s.dead = False
+
+          class Hazard:
+              def __init__(s, x, y, t=0.9):
+                  s.x, s.y, s.t = x, y, t
+
+          class Pickup:
+              def __init__(s, x, y, kind='coin'):
+                  s.x, s.y, s.kind = x, y, kind
+                  s.vx = random.uniform(-35, 35)
+                  s.vy = -120.0
+                  s.life = 14.0
+
+          # ---------- world ----------
+          class World:
+              def __init__(s, seed=1):
+                  s.seed = seed
+                  s.players = {}
+                  s.enemies, s.shots, s.hazards, s.pickups = [], [], [], []
+                  s.texts, s.parts = [], []     # floating numbers / particles (visual only)
+                  s.out = []                    # network events (host -> clients)
+                  s.events = []                 # story/UI events: PART 5/6 pops from here
+                  s.boss = None
+                  s.lock_tx = 0
+                  s.state = 'play'              # play | boss
+                  s.over = None                 # None | 'won' | 'lost'
+                  s.time = 0.0
+                  s.shake = 0.0
+                  s.wake_t = 0.0
+                  s.win_t = None
+                  s.build(seed)
+
+              # ----- level generation (same seed -> same level on every phone) -----
+              def build(s, seed):
+                  rnd = random.Random(seed)
+                  top = [9] * LEVEL_W
+                  h = 9
+                  for x in range(8, ARENA_X - 4):
+                      if rnd.random() < 0.12:
+                          h = clamp(h + rnd.choice((-1, 1)), 7, 10)
+                      top[x] = h
+                  for x in range(ARENA_X - 4, LEVEL_W):
+                      h += (h < 9) - (h > 9)
+                      top[x] = h
+                  s.top = top
+                  s.grid = []
+                  for y in range(LEVEL_H):
+                      row = []
+                      for x in range(LEVEL_W):
+                          row.append('.' if y < top[x] else 'G' if y == top[x] else 'D')
+                      s.grid.append(row)
+                  plats = []
+                  for _ in range(18):
+                      px = rnd.randint(12, ARENA_X - 10)
+                      plats.append((px, top[px] - rnd.randint(3, 4), rnd.randint(3, 5)))
+                  plats += [(118, 6, 4), (126, 5, 4), (140, 6, 4)]
+                  for px, py, ln in plats:
+                      if py < 2:
+                          continue
+                      for x in range(px, min(LEVEL_W - 1, px + ln)):
+                          if s.grid[py][x] == '.':
+                              s.grid[py][x] = 'P'
+                  s.props, s.light_src, s.flies = [], [], []
+                  for x in range(6, LEVEL_W - 2):
+                      r = rnd.random()
+                      if r < 0.07:
+                          s.props.append(('flower', x * TILE + 4, top[x] * TILE - 7, 7, 7))
+                          s.light_src.append(('glow_pink', x * TILE + 7, top[x] * TILE - 4))
+                      elif r < 0.12:
+                          s.props.append(('mush', x * TILE + 4, top[x] * TILE - 8, 8, 8))
+                          s.light_src.append(('glow_cyan', x * TILE + 8, top[x] * TILE - 4))
+                  for px in (ARENA_X * TILE + 40, LEVEL_W * TILE - 28):
+                      s.props.append(('pillar', px, 9 * TILE - 64, 16, 64))
+                  for _ in range(60):
+                      s.flies.append((rnd.choice(['pink', 'cyan', 'yellow', 'green']),
+                                      rnd.randint(20, LEVEL_W * TILE - 20),
+                                      rnd.randint(30, 110), rnd.random() * 6.28))
+                  x = 20
+                  while x < ARENA_X - 6:
+                      if rnd.random() < 0.55:
+                          s.enemies.append(Enemy('beast', x * TILE, top[x] * TILE - 12))
+                      else:
+                          s.enemies.append(Enemy('bat', x * TILE, top[x] * TILE - 70))
+                      x += rnd.randint(6, 10)
+                  s.triggers = [['intro', 0, False], ['forest', 36 * TILE, False],
+                                ['shrine', 78 * TILE, False], ['gate', (ARENA_X - 3) * TILE, False],
+                                ['boss', (ARENA_X + 5) * TILE, False]]
+
+              def tile_key(s, tx, ty):
+                  c = s.grid[ty][tx]
+                  if c == '.':
+                      return None
+                  return 'tile_%s%d' % (c, (tx * 7 + ty * 13) % 4)
+
+              def tile_solid(s, tx, ty):
+                  if tx < 0 or tx >= LEVEL_W or ty >= LEVEL_H:
+                      return True
+                  if ty < 0:
+                      return False
+                  if s.lock_tx and tx < s.lock_tx:
+                      return True
+                  return s.grid[ty][tx] in SOLID
+
+              def ground_y(s, x, y=0):
+                  tx = int(clamp(x // TILE, 0, LEVEL_W - 1))
+                  for ty in range(max(0, int(y // TILE)), LEVEL_H):
+                      if s.grid[ty][tx] in SOLID:
+                          return ty * TILE
+                  return LEVEL_H * TILE
+
+              # ----- players -----
+              def add_player(s, slot, name=None, own=False):
+                  p = Player(slot, name or 'P%d' % (slot + 1))
+                  p.own = own
+                  s.players[slot] = p
+                  return p
+
+              def local_player(s):
+                  for p in s.players.values():
+                      if p.own:
+                          return p
+                  return None
+
+              def nearest_player(s, x, y):
+                  best, bd = None, 1e9
+                  for p in s.players.values():
+                      if p.alive:
+                          d = abs(p.x - x) + abs(p.y - y)
+                          if d < bd:
+                              bd, best = d, p
+                  return best
+
+              # ----- events / fx -----
+              def emit_event(s, name):
+                  s.events.append(name)
+                  s.out.append(['ev', name])
+
+              def add_text(s, x, y, val, code):
+                  s.texts.append([x, y, format(int(val), ',').replace(',', ' '), code, 1.0])
+
+              def text(s, x, y, val, code):
+                  s.add_text(x, y, val, code)
+                  s.out.append(['dmg', round(x, 1), round(y, 1), int(val), code])
+
+              def add_burst(s, x, y, col, n=8):
+                  for _ in range(n):
+                      a = random.random() * 6.28
+                      v = random.uniform(20, 90)
+                      s.parts.append([x, y, math.cos(a) * v, math.sin(a) * v - 30, random.uniform(0.3, 0.7), col])
+
+              def burst(s, x, y, col, n=8):
+                  s.add_burst(x, y, col, n)
+                  s.out.append(['fx', round(x, 1), round(y, 1), col, n])
+
+              def do_shake(s, v):
+                  s.shake = max(s.shake, v)
+                  s.out.append(['shake', v])
+
+              # ----- damage -----
+              def hurt_player(s, p, dmg):
+                  if p.inv > 0 or not p.alive:
+                      return
+                  p.hp -= dmg
+                  p.inv = 1.0
+                  s.text(p.x, p.y - 6, dmg, 'r')
+                  s.burst(p.x + 4, p.y + 8, 'red', 8)
+                  if p.hp <= 0:
+                      p.hp = 0
+                      p.alive = False
+                      p.dead_t = 8.0
+                      s.burst(p.x + 4, p.y + 8, SLOT_COL[p.slot], 24)
+                      s.emit_event('down')
+
+              def hit_enemy(s, e, dmg, crit=False):
+                  e.hp -= dmg
+                  e.flash = 0.1
+                  e.awake = True
+                  cx, cy = e.x + e.W / 2, e.y + e.H / 2
+                  s.text(cx, e.y - 4, dmg, 'y' if crit else 'w')
+                  s.burst(cx, cy, 'white', 3)
+                  if e.hp <= 0 and e.alive:
+                      e.alive = False
+                      s.burst(cx, cy, 'orange', 14)
+                      for _ in range(3 if e.kind == 'bat' else 5):
+                          s.pickups.append(Pickup(cx, cy, 'coin'))
+                      if random.random() < 0.25:
+                          s.pickups.append(Pickup(cx, cy, 'heal'))
+
+              def hit_boss(s, b, dmg, crit=False):
+                  b.hp -= dmg
+                  b.flash = 0.08
+                  s.text(b.x + 15 + random.randint(-8, 8), b.y - 8, dmg, 'y' if crit else 'w')
+                  if b.hp <= 0 and b.alive:
+                      b.hp = 0
+                      b.alive = False
+                      s.burst(b.x + 15, b.y + 22, 'orange', 40)
+                      s.burst(b.x + 15, b.y + 22, 'yellow', 30)
+                      s.do_shake(10)
+                      for _ in range(24):
+                          s.pickups.append(Pickup(b.x + 15, b.y + 10, 'coin'))
+                      s.shots = [h for h in s.shots if h.team == 'p']
+                      s.hazards = []
+                      s.emit_event('boss_dead')
+                      s.win_t = 4.0
+
+              # ----- boss attacks -----
+              def boss_slam(s, b):
+                  s.do_shake(6)
+                  sp = 110 if b.phase == 1 else 150
+                  gy = s.ground_y(b.x + 15, b.y)
+                  for d in (-1, 1):
+                      s.shots.append(Shot(b.x + 15, gy - 5, d * sp, 0, 55, 'e', -1, 'yellow',
+                                          2.4, 0, 2, 'wave'))
+
+              def boss_leaves(s, b, tgt):
+                  n = 5 if b.phase == 1 else 8
+                  tx = tgt.x if tgt else b.x
+                  for i in range(n):
+                      vx = (tx - b.x) / 1.4 + (i - n / 2.0) * 18
+                      s.shots.append(Shot(b.x + 15, b.y + 4, vx, -190, 30, 'e', -1, 'green',
+                                          2.5, 260, 1, 'leaf'))
+
+              def boss_roots(s, b):
+                  for p in s.players.values():
+                      if p.alive:
+                          s.hazards.append(Hazard(p.x + 4, s.ground_y(p.x + 4, p.y)))
+
+              def begin_boss(s):
+                  if s.boss:
+                      s.boss.awake = True
+
+              def start_boss_fight(s):
+                  s.lock_tx = ARENA_X
+                  for p in s.players.values():
+                      if p.x < (ARENA_X + 1) * TILE:
+                          p.x, p.y = (ARENA_X + 2) * TILE + p.slot * 10.0, 100.0
+                          p.tx, p.ty = p.x, p.y
+                          p.vx = p.vy = 0.0
+                          p.rs += 1
+                  s.boss = Boss(BOSS_SPAWN_X, 100.0, len(s.players))
+                  s.wake_t = 9.0          # wakes by itself if the dialogue is skipped
+                  s.state = 'boss'
+                  s.emit_event('boss')
+
+              def check_triggers(s):
+                  alive = [p for p in s.players.values() if p.alive]
+                  if not alive:
+                      return
+                  lead = max(p.x for p in alive)
+                  for t in s.triggers:
+                      if t[2]:
+                          continue
+                      if t[0] == 'intro':
+                          if s.time < 0.6:
+                              continue
+                      elif lead < t[1]:
+                          continue
+                      t[2] = True
+                      if t[0] == 'boss':
+                          s.start_boss_fight()
+                      else:
+                          s.emit_event(t[0])
+
+              # ----- player combat (host only) -----
+              def shoot(s, p):
+                  crit = random.random() < 0.15
+                  dmg = random.randint(110, 190) * (2 if crit else 1)
+                  sx, sy = p.x + 4 + p.face * 5, p.y + 7
+                  vx, vy = p.face * 240.0, 0.0
+                  targets = [e for e in s.enemies if e.alive]
+                  if s.boss and s.boss.alive and s.boss.awake:
+                      targets.append(s.boss)
+                  best, bd = None, 1e9
+                  for t in targets:
+                      dx = t.x + t.W / 2 - sx
+                      dy = t.y + t.H / 2 - sy
+                      if dx * p.face > 0 and abs(dx) < 220 and abs(dy) < 90 and abs(dx) < bd:
+                          bd, best = abs(dx), (dx, dy)
+                  if best:
+                      vy = clamp(best[1] / max(abs(best[0]), 20.0) * 240.0, -140, 140)
+                  s.shots.append(Shot(sx, sy, vx, vy, dmg, 'p', p.slot, SLOT_COL[p.slot], 0.9, crit=crit))
+
+              def nova(s, p):
+                  p.mana -= 40
+                  cx, cy = p.x + 4, p.y + 8
+                  s.burst(cx, cy, SLOT_COL[p.slot], 26)
+                  s.do_shake(4)
+                  for e in list(s.enemies):
+                      if e.alive and abs(e.x + e.W / 2 - cx) < 60 and abs(e.y + e.H / 2 - cy) < 50:
+                          s.hit_enemy(e, 300 + random.randint(0, 80))
+                  b = s.boss
+                  if b and b.alive and b.awake and abs(b.x + 15 - cx) < 80 and abs(b.y + 22 - cy) < 60:
+                      s.hit_boss(b, 320 + random.randint(0, 80))
+                  s.shots = [h for h in s.shots
+                             if not (h.team == 'e' and abs(h.x - cx) < 60 and abs(h.y - cy) < 50)]
+
+              def player_combat(s, p, dt):
+                  p.inv -= dt
+                  if not p.alive:
+                      p.dead_t -= dt
+                      if p.dead_t <= 0:
+                          mate = s.nearest_player(p.x, p.y)
+                          if mate:
+                              p.alive = True
+                              p.hp = p.mhp // 2
+                              p.x, p.y = mate.x, mate.y - 4
+                              p.tx, p.ty = p.x, p.y
+                              p.vx = p.vy = 0.0
+                              p.inv = 2.0
+                              p.rs += 1
+                              s.burst(p.x + 4, p.y + 8, SLOT_COL[p.slot], 16)
+                      return
+                  p.cd -= dt
+                  p.mana = min(100.0, p.mana + 14 * dt)
+                  if p.inp['a'] and p.cd <= 0:
+                      p.cd = 0.22
+                      s.shoot(p)
+                  if p.inp['s'] and not p.skill_prev and p.mana >= 40:
+                      s.nova(p)
+                  p.skill_prev = p.inp['s']
+
+              # ----- host update -----
+              def update(s, dt):
+                  dt = min(dt, 0.05)
+                  s.time += dt
+                  s.check_triggers()
+                  for p in s.players.values():
+                      if p.own:
+                          if p.alive:
+                              p.step_phys(dt, s)
+                      else:
+                          p.lerp(dt)
+                      s.player_combat(p, dt)
+                  for e in s.enemies:
+                      if e.alive:
+                          e.update(dt, s)
+                  b = s.boss
+                  if b and b.alive:
+                      if not b.awake:
+                          s.wake_t -= dt
+                          if s.wake_t <= 0:
+                              b.awake = True
+                      b.update(dt, s)
+                  # shots
+                  for h in s.shots:
+                      h.life -= dt
+                      h.vy += h.grav * dt
+                      h.x += h.vx * dt
+                      h.y += h.vy * dt
+                      if h.life <= 0 or s.tile_solid(int(h.x // TILE), int(h.y // TILE)):
+                          h.dead = True
+                          s.add_burst(h.x, h.y, h.color, 3)
+                          continue
+                      r = 3 * h.size
+                      if h.team == 'p':
+                          for e in s.enemies:
+                              if e.alive and ov(h.x - r, h.y - r, 2 * r, 2 * r, e.x, e.y, e.W, e.H):
+                                  s.hit_enemy(e, h.dmg, h.crit)
+                                  h.dead = True
+                                  break
+                          if not h.dead and b and b.alive and b.awake and \
+                                  ov(h.x - r, h.y - r, 2 * r, 2 * r, b.x, b.y, b.W, b.H):
+                              s.hit_boss(b, h.dmg, h.crit)
+                              h.dead = True
+                      else:
+                          for p in s.players.values():
+                              if p.alive and ov(h.x - r, h.y - r, 2 * r, 2 * r, p.x, p.y, 8, 16):
+                                  s.hurt_player(p, h.dmg)
+                                  h.dead = True
+                                  break
+                  s.shots = [h for h in s.shots if not h.dead]
+                  # root hazards
+                  for hz in s.hazards:
+                      hz.t -= dt
+                      if -0.35 < hz.t <= 0:
+                          for p in s.players.values():
+                              if p.alive and ov(hz.x - 5, hz.y - 28, 10, 28, p.x, p.y, 8, 16):
+                                  s.hurt_player(p, 50)
+                  s.hazards = [hz for hz in s.hazards if hz.t > -0.35]
+                  # contact damage
+                  for p in s.players.values():
+                      if not p.alive:
+                          continue
+                      for e in s.enemies:
+                          if e.alive and e.awake and ov(p.x, p.y, 8, 16, e.x, e.y, e.W, e.H):
+                              s.hurt_player(p, e.dmg)
+                      if b and b.alive and b.awake and ov(p.x, p.y, 8, 16, b.x + 4, b.y, b.W - 8, b.H):
+                          s.hurt_player(p, 45)
+                  # pickups
+                  for k in s.pickups:
+                      k.life -= dt
+                      k.x += k.vx * dt
+                      k.vx *= 0.96
+                      if not s.tile_solid(int(k.x // TILE), int((k.y + 3) // TILE)):
+                          k.vy = min(k.vy + 400 * dt, 200.0)
+                          k.y += k.vy * dt
+                      else:
+                          k.vy = 0.0
+                      for p in s.players.values():
+                          if p.alive and abs(p.x + 4 - k.x) < 10 and abs(p.y + 8 - k.y) < 12:
+                              if k.kind == 'coin':
+                                  p.coins += 10
+                              else:
+                                  heal = min(60, p.mhp - p.hp)
+                                  p.hp += heal
+                                  if heal:
+                                      s.text(p.x, p.y - 6, heal, 'g')
+                              k.life = 0
+                              s.out.append(['fx', round(k.x, 1), round(k.y, 1), 'yellow', 4])
+                              break
+                  s.pickups = [k for k in s.pickups if k.life > 0]
+                  s.enemies = [e for e in s.enemies if e.alive]
+                  s.tick_fx(dt)
+                  # end of game
+                  if s.win_t is not None:
+                      s.win_t -= dt
+                      if s.win_t <= 0:
+                          s.win_t = None
+                          s.over = 'won'
+                          s.emit_event('won')
+                  if s.over is None and s.players and not any(p.alive for p in s.players.values()):
+                      s.over = 'lost'
+                      s.emit_event('lost')
+
+              def tick_fx(s, dt):
+                  s.shake = max(0.0, s.shake - 12 * dt)
+                  for t in s.texts:
+                      t[1] -= 16 * dt
+                      t[4] -= dt
+                  s.texts = [t for t in s.texts if t[4] > 0]
+                  for q in s.parts:
+                      q[0] += q[2] * dt
+                      q[1] += q[3] * dt
+                      q[3] += 300 * dt
+                      q[4] -= dt
+                  s.parts = [q for q in s.parts if q[4] > 0]
+
+              # ----- client side -----
+              def update_client(s, dt):
+                  dt = min(dt, 0.05)
+                  s.time += dt
+                  k = min(1.0, dt * 14)
+                  for p in s.players.values():
+                      if p.own:
+                          if p.alive:
+                              p.step_phys(dt, s)
+                          p.inv -= dt
+                      else:
+                          p.lerp(dt)
+                  for e in s.enemies:
+                      e.anim += dt
+                      e.x += (e.tx - e.x) * k
+                      e.y += (e.ty - e.y) * k
+                  b = s.boss
+                  if b:
+                      b.anim += dt
+                      b.flash = max(0.0, b.flash - dt)
+                      b.x += (b.tx - b.x) * k
+                      b.y += (b.ty - b.y) * k
+                  for h in s.shots:
+                      h.x += h.vx * dt
+                      h.y += h.vy * dt
+                  for hz in s.hazards:
+                      hz.t -= dt
+                  s.tick_fx(dt)
+
+              def snapshot(s):
+                  b = s.boss
+                  d = {
+                      'p': {str(k): [round(p.x, 1), round(p.y, 1), round(p.vx, 1), round(p.vy, 1),
+                                     p.face, int(p.ground), p.hp, p.mhp, int(p.mana), p.coins,
+                                     int(p.alive), p.rs, round(max(0.0, p.inv), 1)]
+                            for k, p in s.players.items()},
+                      'e': [[e.id, e.kind, round(e.x, 1), round(e.y, 1), round(e.vx, 1),
+                             round(e.vy, 1), e.face, e.hp, e.mhp, int(e.awake)]
+                            for e in s.enemies if e.alive],
+                      's': [[round(h.x, 1), round(h.y, 1), round(h.vx, 1), round(h.vy, 1),
+                             h.color, h.kind, h.size, h.team] for h in s.shots],
+                      'h': [[round(h.x, 1), round(h.y, 1), round(h.t, 2)] for h in s.hazards],
+                      'k': [[round(k.x, 1), round(k.y, 1), k.kind] for k in s.pickups],
+                      'b': None if b is None else [round(b.x, 1), round(b.y, 1), b.face, b.hp, b.mhp,
+                                                   b.state, b.phase, int(b.awake), int(b.alive)],
+                      'st': s.state, 'lk': s.lock_tx, 'ov': s.over, 'o': s.out,
+                  }
+                  s.out = []
+                  return d
+
+              def apply_snapshot(s, d, my_slot):
+                  for k, a in d['p'].items():
+                      slot = int(k)
+                      p = s.players.get(slot)
+                      if p is None:
+                          p = s.add_player(slot, own=(slot == my_slot))
+                          p.x = p.tx = a[0]
+                          p.y = p.ty = a[1]
+                          p.rs = a[11]
+                      p.hp, p.mhp, p.mana, p.coins = a[6], a[7], a[8], a[9]
+                      p.alive, p.inv = bool(a[10]), a[12]
+                      if p.own:
+                          if a[11] != p.rs:
+                              p.rs = a[11]
+                              p.x, p.y = a[0], a[1]
+                              p.vx = p.vy = 0.0
+                      else:
+                          p.tx, p.ty = a[0], a[1]
+                          p.vx, p.vy, p.face, p.ground = a[2], a[3], a[4], bool(a[5])
+                          p.rs = a[11]
+                  have = dict((e.id, e) for e in s.enemies)
+                  new = []
+                  for a in d['e']:
+                      e = have.get(a[0])
+                      if e is None:
+                          e = Enemy(a[1], a[2], a[3], eid=a[0])
+                      e.tx, e.ty = a[2], a[3]
+                      e.vx, e.vy, e.face = a[4], a[5], a[6]
+                      e.hp, e.mhp, e.awake = a[7], a[8], bool(a[9])
+                      new.append(e)
+                  s.enemies = new
+                  s.shots = [Shot(a[0], a[1], a[2], a[3], 0, a[7], -1, a[4], 5.0, 0.0, a[6], a[5])
+                             for a in d['s']]
+                  s.hazards = [Hazard(a[0], a[1], a[2]) for a in d['h']]
+                  s.pickups = []
+                  for a in d['k']:
+                      kk = Pickup(a[0], a[1], a[2])
+                      kk.vx = kk.vy = 0.0
+                      s.pickups.append(kk)
+                  bb = d['b']
+                  if bb is not None:
+                      if s.boss is None:
+                          s.boss = Boss(bb[0], bb[1])
+                          s.boss.x, s.boss.y = bb[0], bb[1]
+                      b = s.boss
+                      b.tx, b.ty, b.face = bb[0], bb[1], bb[2]
+                      b.hp, b.mhp, b.state, b.phase = bb[3], bb[4], bb[5], bb[6]
+                      b.awake, b.alive = bool(bb[7]), bool(bb[8])
+                  s.state, s.lock_tx, s.over = d['st'], d['lk'], d['ov']
+                  for ev in d['o']:
+                      if ev[0] == 'dmg':
+                          s.add_text(ev[1], ev[2], ev[3], ev[4])
+                      elif ev[0] == 'fx':
+                          s.add_burst(ev[1], ev[2], ev[3], ev[4])
+                      elif ev[0] == 'shake':
+                          s.shake = max(s.shake, ev[1])
+                      elif ev[0] == 'ev':
+                          s.events.append(ev[1])
+
+              # ----- draw lists for PART 6 (game coords: pixels, y down) -----
+              def sprites(s, cx):
+                  lo, hi = cx - 70, cx + VIEW_W + 70
+                  L = []
+                  for key, x, y, w, h in s.props:
+                      if lo < x < hi:
+                          L.append((key, x, y, w, h, 1.0))
+                  for col, x, y, ph in s.flies:
+                      if lo < x < hi:
+                          L.append(('orb_' + col, x - 2.5, y + 4 * math.sin(s.time * 1.5 + ph) - 2.5, 5, 5, 1.0))
+                  for k in s.pickups:
+                      L.append(('orb_yellow' if k.kind == 'coin' else 'orb_pink',
+                                k.x - 2.5, k.y - 2.5 + math.sin(s.time * 6 + k.x), 5, 5, 1.0))
+                  for hz in s.hazards:
+                      if hz.t > 0:
+                          if int(hz.t * 10) % 2 == 0:
+                              L.append(('orb_yellow', hz.x - 2.5, hz.y - 5, 5, 5, 1.0))
+                      else:
+                          L.append(('root', hz.x - 5, hz.y - 28, 10, 30, 1.0))
+                  for e in s.enemies:
+                      if e.alive and lo < e.x < hi:
+                          L.append(e.sprite() + (1.0,))
+                  if s.boss:
+                      sp = s.boss.sprite()
+                      if sp:
+                          L.append(sp + (1.0,))
+                  for p in s.players.values():
+                      sp = p.sprite()
+                      if sp:
+                          al = 0.35 if (p.inv > 0 and int(s.time * 20) % 2 == 0) else 1.0
+                          L.append(sp + (al,))
+                  for h in s.shots:
+                      w = 5 * h.size
+                      L.append(('orb_' + h.color, h.x - w / 2.0, h.y - w / 2.0, w, w, 1.0))
+                  return L
+
+              def lights(s, cx):
+                  lo, hi = cx - 40, cx + VIEW_W + 40
+                  L = []
+                  for key, x, y in s.light_src:
+                      if lo < x < hi:
+                          L.append((key, x, y))
+                  for col, x, y, ph in s.flies:
+                      if lo < x < hi:
+                          L.append(('glow_' + col, x, y + 4 * math.sin(s.time * 1.5 + ph)))
+                  for h in s.shots:
+                      L.append(('glow_' + h.color, h.x, h.y))
+                  for p in s.players.values():
+                      if p.alive:
+                          L.append(('glow_' + SLOT_COL[p.slot], p.x + 4, p.y + 6))
+                  return L
+
+              def bars(s, cx):
+                  L = []
+                  for p in s.players.values():
+                      if p.alive:
+                          L.append((p.x - 2, p.y - 6, 12, p.hp / float(max(1, p.mhp)), 'p%d' % p.slot, p.name))
+                  for e in s.enemies:
+                      if e.alive and e.hp < e.mhp:
+                          L.append((e.x - 1, e.y - 5, e.W + 2, e.hp / float(e.mhp), 'r', ''))
+                  return L
+
+          # ---------- extra sprites (root spike) ----------
+          def build_extra_sprites():
+              rnd = random.Random(21)
+              r = Px(10, 30)
+              for y in range(1, 29):
+                  w = 1 + ((y - 1) * 7) // 27
+                  st = 1 + (8 - w) // 2
+                  for x in range(st, st + w):
+                      r.p(x, y, 'O' if rnd.random() < 0.8 else 'o')
+              r.shade({'O': ('q', 'o')})
+              r.p(5, 1, 'Y')
+              r.outline('K')
+              SPR['root'] = make_tex(r.rows(), BOSS_PAL)
+
+          _build_sprites_p2 = build_sprites
+          def build_sprites():
+              _build_sprites_p2()
+              build_extra_sprites()
+
+          # ---------- (PART 4 continues below) ----------
+          # ===================== PART 4: LAN networking (host / join by IP) =====================
+          # Protocol: TCP, one JSON message per line, port = PORT.
+          # host -> clients : welcome, lobby, start, snap (20/s), full
+          # client -> host  : hello, in (30/s)
+
+          def get_local_ip():
+              """the address other phones must type (hotspot host is usually 192.168.43.1)"""
+              for target in (('8.8.8.8', 80), ('192.168.43.1', 9), ('10.255.255.255', 1)):
+                  sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                  try:
+                      sk.connect(target)
+                      ip = sk.getsockname()[0]
+                      if ip and not ip.startswith('127.') and ip != '0.0.0.0':
+                          return ip
+                  except Exception:
+                      pass
+                  finally:
+                      sk.close()
+              try:
+                  ip = socket.gethostbyname(socket.gethostname())
+                  if ip and not ip.startswith('127.'):
+                      return ip
+              except Exception:
+                  pass
+              return '192.168.43.1'
+
+          class Net:
+              def __init__(s):
+                  s.gen = 0
+                  s.lock = threading.Lock()
+                  s.reset()
+
+              def reset(s):
+                  s.role = None          # None | 'host' | 'client'
+                  s.status = 'idle'      # idle | hosting | connecting | connected | failed | lost
+                  s.msg = ''
+                  s.ip = ''
+                  s.slot = 0
+                  s.seed = 1
+                  s.names = {}           # slot -> player name (lobby list)
+                  s.started = False      # True when the host pressed Start
+                  s.events = []          # UI messages like 'left:Ali'
+                  s.srv = None
+                  s.csock = None
+                  s.clients = {}         # host only: slot -> socket
+                  s.inbox = []
+                  s.snap_t = 0.0
+                  s.in_t = 0.0
+                  s.alive = False
+                  s.my_name = 'Hero'
+
+              # ---------- low level ----------
+              def _send(s, sock, msg):
+                  try:
+                      sock.sendall(json.dumps(msg, separators=(',', ':')).encode('utf-8') + b'\n')
+                      return True
+                  except Exception:
+                      return False
+
+              def _read_loop(s, sock, slot, gen):
+                  buf = b''
+                  while s.alive and gen == s.gen:
+                      try:
+                          data = sock.recv(16384)
+                          if not data:
+                              break
+                          buf += data
+                      except socket.timeout:
+                          continue
+                      except Exception:
+                          break
+                      while b'\n' in buf:
+                          line, buf = buf.split(b'\n', 1)
+                          if not line:
+                              continue
+                          try:
+                              m = json.loads(line.decode('utf-8'))
+                          except Exception:
+                              continue
+                          with s.lock:
+                              if gen == s.gen:
+                                  s.inbox.append((slot, m))
+                  with s.lock:
+                      if gen == s.gen:
+                          s.inbox.append((slot, {'t': 'bye'}))
+
+              def broadcast(s, msg):
+                  for slot, sock in list(s.clients.items()):
+                      if not s._send(sock, msg):
+                          with s.lock:
+                              s.inbox.append((slot, {'t': 'bye'}))
+
+              def _send_lobby(s):
+                  s.broadcast({'t': 'lobby', 'n': dict((str(k), v) for k, v in s.names.items())})
+
+              # ---------- host ----------
+              def host_start(s, name='Host'):
+                  s.stop()
+                  s.role = 'host'
+                  s.my_name = name
+                  s.names = {0: name}
+                  s.slot = 0
+                  s.seed = random.randint(1, 99999)
+                  s.alive = True
+                  try:
+                      srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                      srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                      srv.bind(('0.0.0.0', PORT))
+                      srv.listen(4)
+                      srv.settimeout(0.5)
+                  except Exception as ex:
+                      s.status = 'failed'
+                      s.msg = 'Cannot host: %s' % ex
+                      s.alive = False
+                      return False
+                  s.srv = srv
+                  s.ip = get_local_ip()
+                  s.status = 'hosting'
+                  s.msg = 'Waiting for players...'
+                  threading.Thread(target=s._accept_loop, args=(srv, s.gen), daemon=True).start()
+                  return True
+
+              def _accept_loop(s, srv, gen):
+                  while s.alive and gen == s.gen:
+                      try:
+                          c, _addr = srv.accept()
+                      except socket.timeout:
+                          continue
+                      except Exception:
+                          break
+                      try:
+                          c.settimeout(0.5)
+                          c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                      except Exception:
+                          pass
+                      slot = None
+                      with s.lock:
+                          free = [i for i in range(1, MAX_PLAYERS) if i not in s.clients]
+                          if free and not s.started:
+                              slot = free[0]
+                              s.clients[slot] = c
+                              s.names[slot] = 'P%d' % (slot + 1)
+                      if slot is None:
+                          s._send(c, {'t': 'full'})
+                          try:
+                              c.close()
+                          except Exception:
+                              pass
+                          continue
+                      threading.Thread(target=s._read_loop, args=(c, slot, gen), daemon=True).start()
+
+              def start_game(s):
+                  """host presses Start: nobody else can join, everyone builds the same world"""
+                  s.started = True
+                  s.broadcast({'t': 'start', 'seed': s.seed})
+
+              def _drop(s, slot, world):
+                  with s.lock:
+                      sock = s.clients.pop(slot, None)
+                      nm = s.names.pop(slot, None)
+                  if sock:
+                      try:
+                          sock.close()
+                      except Exception:
+                          pass
+                  if world is not None and slot in world.players:
+                      world.players.pop(slot, None)
+                  if nm:
+                      s.events.append('left:%s' % nm)
+                  if not s.started:
+                      s._send_lobby()
+
+              # ---------- client ----------
+              def join(s, ip, name='Hero'):
+                  s.stop()
+                  ip = (ip or '').strip()
+                  s.role = 'client'
+                  s.my_name = name
+                  s.alive = True
+                  if not ip:
+                      s.status = 'failed'
+                      s.msg = 'Type the host address'
+                      return
+                  s.status = 'connecting'
+                  s.msg = 'Connecting to %s ...' % ip
+                  s.ip = ip
+                  threading.Thread(target=s._connect, args=(ip, s.gen), daemon=True).start()
+
+              def _connect(s, ip, gen):
+                  try:
+                      c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                      c.settimeout(6.0)
+                      c.connect((ip, PORT))
+                      c.settimeout(0.5)
+                      c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                  except Exception:
+                      if gen == s.gen:
+                          s.status = 'failed'
+                          s.msg = 'Cannot reach %s (same Wi-Fi / hotspot?)' % ip
+                      return
+                  if gen != s.gen:
+                      try:
+                          c.close()
+                      except Exception:
+                          pass
+                      return
+                  s.csock = c
+                  s._send(c, {'t': 'hello', 'n': s.my_name})
+                  s._read_loop(c, -1, gen)
+
+              # ---------- per-frame (call from the Kivy clock, main thread) ----------
+              def poll(s, world=None):
+                  with s.lock:
+                      box, s.inbox = s.inbox, []
+                  for slot, m in box:
+                      t = m.get('t')
+                      if s.role == 'host':
+                          if t == 'hello':
+                              nm = str(m.get('n', 'Hero'))[:10] or 'P%d' % (slot + 1)
+                              s.names[slot] = nm
+                              sock = s.clients.get(slot)
+                              if sock:
+                                  s._send(sock, {'t': 'welcome', 'slot': slot, 'seed': s.seed})
+                              s._send_lobby()
+                          elif t == 'in':
+                              if world is not None and slot in world.players:
+                                  try:
+                                      world.players[slot].set_remote(m['d'])
+                                  except Exception:
+                                      pass
+                          elif t == 'bye':
+                              s._drop(slot, world)
+                      elif s.role == 'client':
+                          if t == 'welcome':
+                              s.slot = int(m['slot'])
+                              s.seed = int(m['seed'])
+                              s.status = 'connected'
+                              s.msg = 'Connected - waiting for host to start'
+                          elif t == 'lobby':
+                              s.names = dict((int(k), v) for k, v in m['n'].items())
+                          elif t == 'start':
+                              s.seed = int(m['seed'])
+                              s.started = True
+                          elif t == 'snap':
+                              if world is not None:
+                                  try:
+                                      world.apply_snapshot(m['d'], s.slot)
+                                  except Exception:
+                                      pass
+                          elif t == 'full':
+                              s.status = 'failed'
+                              s.msg = 'Room is full or the game already started'
+                          elif t == 'bye':
+                              if s.status != 'failed':
+                                  s.status = 'lost'
+                                  s.msg = 'Connection to host lost'
+
+              def tick(s, world, dt):
+                  """send our part of the state: host -> snapshots, client -> own movement"""
+                  if s.role == 'host':
+                      s.snap_t += dt
+                      if s.snap_t >= 0.05:
+                          s.snap_t = 0.0
+                          if s.clients:
+                              s.broadcast({'t': 'snap', 'd': world.snapshot()})
+                  elif s.role == 'client' and s.csock is not None and s.status == 'connected':
+                      s.in_t += dt
+                      if s.in_t >= 1.0 / 30.0:
+                          s.in_t = 0.0
+                          p = world.local_player()
+                          if p is not None:
+                              if not s._send(s.csock, {'t': 'in', 'd': p.net_state()}):
+                                  s.status = 'lost'
+                                  s.msg = 'Connection to host lost'
+
+              def stop(s):
+                  s.gen += 1
+                  s.alive = False
+                  socks = list(s.clients.values()) + [s.csock, s.srv]
+                  for sk in socks:
+                      if sk is not None:
+                          try:
+                              sk.close()
+                          except Exception:
+                              pass
+                  s.reset()
+
+              def count(s):
+                  return len(s.names)
+
+          NET = Net()
+
+          # ---------- (PART 5 continues below) ----------
+          # ===================== PART 5: story & dialogue =====================
+          # Dialogue never pauses the world (multiplayer), it is an overlay.
+          # PART 6 creates Story(is_host), calls story.feed(world) + story.update(dt) every frame,
+          # draws story.visible() / story.banner, and calls story.tap() on screen tap.
+
+          SPEAKERS = {
+              0: ('Merlo', 'cyan'),
+              1: ('Sylva', 'green'),
+              2: ('Ember', 'yellow'),
+              3: ('Kael', 'pink'),
+              'N': ('', 'white'),
+              'B': ('Elder Thornroot', 'orange'),
+          }
+
+          # scene = chapter title (optional), lines [(speaker, text)], then ('wake' = boss starts fighting)
+          SCENES = {
+              'intro': {
+                  'chapter': 'CHAPTER I - THE WHISPERING WOODS',
+                  'lines': [
+                      ('N', 'The Rift tore open at dawn. Every spirit in the forest fell silent.'),
+                      (0, 'The Heartroot is dying. Without it, the whole forest will wither.'),
+                      (1, 'Then we walk to the shrine and wake it. Stay close, all of you.'),
+                      (2, 'Fine by me. Something is out there, I can hear it breathing.'),
+                      (3, 'Keep your weapons ready. Let them come.'),
+                  ],
+              },
+              'forest': {
+                  'chapter': 'THE GLOWING DEEP',
+                  'lines': [
+                      ('N', 'The air hums with pale light. Spores drift like tiny stars.'),
+                      (1, 'These mushrooms glow when the Rift is near. They are warning us.'),
+                      (3, 'Bats above us!'),
+                      (0, 'And beasts on the ground. The Rift has twisted them all.'),
+                  ],
+              },
+              'shrine': {
+                  'chapter': 'THE BROKEN SHRINE',
+                  'lines': [
+                      ('N', 'An ancient shrine, cracked down the middle, pulses with dull gold light.'),
+                      (0, 'The Heartroot seal... it was shattered from the inside.'),
+                      (2, 'From the inside? Who would do that?'),
+                      (1, 'Someone the forest trusted. Its Warden.'),
+                      (3, 'Then the Warden waits ahead, and we will have to face it.'),
+                  ],
+              },
+              'gate': {
+                  'chapter': "THE WARDEN'S GATE",
+                  'lines': [
+                      ('N', 'Two carved pillars rise ahead. Gold runes glow in time with your heartbeat.'),
+                      (0, 'Once we cross, the way back will close behind us.'),
+                      (2, 'Good. I hate backtracking.'),
+                      (1, 'Together, then.'),
+                  ],
+              },
+              'boss': {
+                  'chapter': 'ELDER THORNROOT',
+                  'lines': [
+                      ('N', 'The ground trembles. A giant of bark and horn rises from the roots.'),
+                      ('B', 'Little sparks... Have you come to steal the Heartroot\'s last breath?'),
+                      (1, 'Elder, the Rift has twisted you. Let us help you!'),
+                      ('B', 'The Rift has set me free. Now fall, and feed the forest!'),
+                      (3, 'Not today! Spread out and keep moving!'),
+                  ],
+                  'then': 'wake',
+              },
+              'boss_phase2': {
+                  'lines': [
+                      ('B', 'ENOUGH! Let the whole forest answer me!'),
+                      (2, 'He is getting angrier. Stay on your feet!'),
+                  ],
+              },
+              'boss_dead': {
+                  'lines': [
+                      ('B', 'At last... the roots are quiet. Thank you, little sparks.'),
+                      (0, 'The Rift is closing. Look, the forest is breathing again.'),
+                  ],
+              },
+              'won': {
+                  'chapter': 'THE FOREST AWAKENS',
+                  'lines': [
+                      ('N', 'Dawn light spills through the canopy. The Heartroot glows green once more.'),
+                      (1, 'We did it.'),
+                      (2, '...Now can we please eat something?'),
+                      (3, 'This was only the first Rift, you know.'),
+                      (0, 'Then our journey has only just begun.'),
+                      ('N', 'THE END - to be continued...'),
+                  ],
+              },
+              'lost': {
+                  'lines': [
+                      ('N', 'The light fades. The forest falls silent once more, and the Rift grows.'),
+                  ],
+              },
+          }
+
+          BARKS_DOWN = [
+              'Hang on, we will get you back up!',
+              'No! Hold the line!',
+              'Somebody cover them!',
+              'Stay with us!',
+          ]
+
+          class Story:
+              CPS = 38.0                      # typewriter speed (chars per second)
+
+              def __init__(s, is_host=False):
+                  s.is_host = is_host
+                  s.world = None
+                  s.queue = []
+                  s.cur = None
+                  s.shown = 0.0
+                  s.hold = 0.0
+                  s.banner = None             # [chapter text, seconds left]
+                  s.seen = set()
+
+              # ----- build queue from world events -----
+              def feed(s, world):
+                  s.world = world
+                  evs, world.events = world.events, []
+                  for ev in evs:
+                      if ev == 'down':
+                          s.bark(world)
+                          continue
+                      sc = SCENES.get(ev)
+                      if sc is None or ev in s.seen:
+                          continue
+                      s.seen.add(ev)
+                      s.push(world, sc)
+
+              def push(s, world, sc):
+                  if sc.get('chapter'):
+                      s.banner = [sc['chapter'], 3.2]
+                  lines = [{'who': w, 'text': t, 'then': None}
+                           for (w, t) in sc['lines'] if w in ('N', 'B') or w in world.players]
+                  then = sc.get('then')
+                  if lines:
+                      lines[-1]['then'] = then
+                      s.queue.extend(lines)
+                  elif then:
+                      s.finish(then)
+
+              def bark(self, world):
+                  if self.cur is not None or self.queue or random.random() > 0.5:
+                      return
+                  alive = [k for k, p in world.players.items() if p.alive]
+                  if not alive:
+                      return
+                  self.queue.append({'who': random.choice(alive),
+                                     'text': random.choice(BARKS_DOWN), 'then': None})
+
+              def finish(s, then):
+                  if then == 'wake' and s.is_host and s.world is not None:
+                      s.world.begin_boss()
+
+              # ----- per frame -----
+              def update(s, dt):
+                  if s.banner:
+                      s.banner[1] -= dt
+                      if s.banner[1] <= 0:
+                          s.banner = None
+                  if s.cur is None:
+                      if s.queue:
+                          s.cur = s.queue.pop(0)
+                          s.shown = 0.0
+                          s.hold = 0.0
+                      return
+                  n = len(s.cur['text'])
+                  if s.shown < n:
+                      s.shown = min(float(n), s.shown + s.CPS * dt)
+                  else:
+                      s.hold += dt
+                      if s.hold > 1.8 + n * 0.02:
+                          s.next()
+
+              def next(s):
+                  then = s.cur.get('then') if s.cur else None
+                  s.cur = None
+                  if then:
+                      s.finish(then)
+
+              def tap(s):
+                  """returns True if the tap was used by the dialogue"""
+                  if s.cur is None:
+                      return False
+                  if s.shown < len(s.cur['text']):
+                      s.shown = float(len(s.cur['text']))
+                  else:
+                      s.next()
+                  return True
+
+              def skip_all(s):
+                  while s.cur is not None or s.queue:
+                      if s.cur is None:
+                          s.cur = s.queue.pop(0)
+                      s.next()
+                  s.banner = None
+
+              def busy(s):
+                  return s.cur is not None or bool(s.queue)
+
+              def visible(s):
+                  """None or dict: name, color (key of PCOL), text (typed so far), portrait (SPR key or None), done"""
+                  if s.cur is None:
+                      return None
+                  who = s.cur['who']
+                  name, col = SPEAKERS[who]
+                  if who == 'B':
+                      port = 'boss_L'
+                  elif who == 'N':
+                      port = None
+                  else:
+                      port = 'hero%d_idle_R' % who
+                  full = s.cur['text']
+                  n = int(s.shown)
+                  return {'name': name, 'color': col, 'text': full[:n], 'portrait': port,
+                          'done': n >= len(full)}
+
+          # ---------- (PART 6 continues below) ----------
+          # ===================== PART 6: UI, rendering, main loop =====================
+          from kivy.core.text import Label as CoreLabel
+          from kivy.graphics import RoundedRectangle, BlendFunc
+
+          CAM_Y = LEVEL_H * TILE - VIEW_H          # vertical camera offset (level is 192px tall)
+          TXT_COL = {'w': (1, 1, 1), 'y': (1, 0.88, 0.29), 'r': (1, 0.27, 0.24), 'g': (0.48, 1, 0.78)}
+
+          def c3(rgb, a=1.0):
+              return (rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0, a)
+
+          class Game(Widget):
+              def __init__(s, **kw):
+                  Widget.__init__(s, **kw)
+                  s.scr = 'menu'                   # menu | host | join | game
+                  s.world = None
+                  s.story = None
+                  s.btns = []
+                  s.touches = {}
+                  s.ip = '192.168.43.1'
+                  s.lc = {}
+                  s.cam = 0.0
+                  s.sc = 4
+                  s.ox = s.oy = 0
+                  s.shx = s.shy = 0
+                  s.toast = None
+                  s.dlg_key = None
+                  s.dlg_tex = None
+                  s.t = 0.0
+                  Window.bind(on_keyboard=s.on_key)
+                  Clock.schedule_interval(s.loop, 1.0 / 60.0)
+
+              # ---------- navigation ----------
+              def on_key(s, win, key, *a):
+                  if key == 27:                    # Android back button
+                      if s.scr == 'menu':
+                          return False
+                      s.go_menu()
+                      return True
+                  return False
+
+              def go_menu(s):
+                  NET.stop()
+                  s.world = None
+                  s.story = None
+                  s.scr = 'menu'
+                  s.touches.clear()
+
+              def begin_game(s):
+                  w = World(NET.seed)
+                  if NET.role == 'host':
+                      for slot in sorted(NET.names):
+                          w.add_player(slot, SPEAKERS[slot][0], own=(slot == 0))
+                  s.world = w
+                  s.story = Story(NET.role == 'host')
+                  s.scr = 'game'
+                  s.cam = 0.0
+                  s.dlg_key = None
+                  s.touches.clear()
+
+              def press(s, n):
+                  if n == 'host':
+                      NET.host_start('Merlo')
+                      s.scr = 'host'
+                  elif n == 'join':
+                      NET.stop()
+                      s.scr = 'join'
+                  elif n == 'connect':
+                      NET.join(s.ip, 'Hero')
+                  elif n == 'start':
+                      if NET.status == 'hosting':
+                          NET.start_game()
+                          s.begin_game()
+                  elif n in ('back', 'menu'):
+                      s.go_menu()
+                  elif n == 'quit':
+                      App.get_running_app().stop()
+                  elif n.startswith('k'):
+                      ch = n[1:]
+                      if ch == 'del':
+                          s.ip = s.ip[:-1]
+                      elif len(s.ip) < 15:
+                          s.ip += ch
+
+              # ---------- touch ----------
+              def ctl_rects(s):
+                  W, H = Window.size
+                  u = H / 9.0
+                  b = 1.9 * u
+                  return [('L', 0.4 * u, 0.4 * u, b, b, '<'),
+                          ('R', 0.7 * u + b, 0.4 * u, b, b, '>'),
+                          ('A', W - 0.4 * u - b, 0.4 * u, b, b, 'FIRE'),
+                          ('J', W - 0.7 * u - 2 * b, 0.4 * u, b, b, 'JUMP'),
+                          ('S', W - 0.55 * u - 1.5 * b, 0.7 * u + b, b, b, 'NOVA')]
+
+              def on_ctl(s, x, y):
+                  for name, rx, ry, rw, rh, lab in s.ctl_rects():
+                      if rx - 10 <= x <= rx + rw + 10 and ry - 10 <= y <= ry + rh + 10:
+                          return name
+                  return None
+
+              def pressed(s):
+                  pr = set()
+                  for (x, y) in s.touches.values():
+                      n = s.on_ctl(x, y)
+                      if n:
+                          pr.add(n)
+                  return pr
+
+              def on_touch_down(s, t):
+                  s.touches[t.uid] = (t.x, t.y)
+                  for name, x, y, w, h in s.btns:
+                      if x <= t.x <= x + w and y <= t.y <= y + h:
+                          s.press(name)
+                          return True
+                  if s.scr == 'game' and s.story is not None and not s.on_ctl(t.x, t.y):
+                      s.story.tap()
+                  return True
+
+              def on_touch_move(s, t):
+                  if t.uid in s.touches:
+                      s.touches[t.uid] = (t.x, t.y)
+                  return True
+
+              def on_touch_up(s, t):
+                  s.touches.pop(t.uid, None)
+                  return True
+
+              # ---------- text / shape helpers ----------
+              def tex(s, text, size, bold=False, width=None):
+                  size = int(max(8, size))
+                  k = (text, size, bold, width)
+                  t = s.lc.get(k)
+                  if t is None:
+                      if len(s.lc) > 500:
+                          s.lc.clear()
+                      lb = CoreLabel(text=text, font_size=size, bold=bold,
+                                     text_size=(width, None) if width else (None, None))
+                      lb.refresh()
+                      t = lb.texture
+                      s.lc[k] = t
+                  return t
+
+              def txt(s, text, x, y, size, col=(1, 1, 1, 1), al='c', bold=False, shadow=True):
+                  if not text:
+                      return
+                  t = s.tex(text, size, bold)
+                  w, h = t.size
+                  px = x - w / 2.0 if al == 'c' else (x if al == 'l' else x - w)
+                  py = y - h / 2.0
+                  if shadow:
+                      Color(0, 0, 0, col[3] * 0.8)
+                      Rectangle(texture=t, pos=(px + 2, py - 2), size=(w, h))
+                  Color(*col)
+                  Rectangle(texture=t, pos=(px, py), size=(w, h))
+
+              def box(s, x, y, w, h, col, r=0):
+                  Color(*col)
+                  if r:
+                      RoundedRectangle(pos=(x, y), size=(w, h), radius=[r])
+                  else:
+                      Rectangle(pos=(x, y), size=(w, h))
+
+              def button(s, name, label, x, y, w, h, col=(0.15, 0.6, 0.75, 1), size=None):
+                  s.btns.append((name, x, y, w, h))
+                  u = Window.height / 9.0
+                  s.box(x, y, w, h, (0, 0, 0, 0.6), u * 0.16)
+                  s.box(x + 3, y + 3, w - 6, h - 6, col, u * 0.12)
+                  s.txt(label, x + w / 2, y + h / 2, size or u * 0.55, (1, 1, 1, 1), 'c', True)
+
+              def spr_scr(s, key, x, y, w, h, a=1.0):
+                  t = SPR.get(key)
+                  if t is None:
+                      return
+                  Color(1, 1, 1, a)
+                  Rectangle(texture=t, pos=(x, y), size=(w, h))
+
+              def gx(s, x):
+                  return s.ox + (round(x - s.cam) + s.shx) * s.sc
+
+              def gy(s, y, h):
+                  return s.oy + (VIEW_H - round(y - CAM_Y) - h + s.shy) * s.sc
+
+              def spr(s, key, x, y, w, h, a=1.0):
+                  t = SPR.get(key)
+                  if t is None:
+                      return
+                  Color(1, 1, 1, a)
+                  Rectangle(texture=t, pos=(s.gx(x), s.gy(y, h)), size=(w * s.sc, h * s.sc))
+
+              # ---------- screens ----------
+              def bg_menu(s):
+                  W, H = Window.size
+                  Color(1, 1, 1, 1)
+                  Rectangle(texture=SPR['bg_far'], pos=(0, 0), size=(W, H))
+                  Rectangle(texture=SPR['bg_mid'], pos=(0, 0), size=(W, H))
+                  s.box(0, 0, W, H, (0, 0, 0, 0.35))
+
+              def draw_menu(s):
+                  W, H = Window.size
+                  u = H / 9.0
+                  s.bg_menu()
+                  s.txt('PIXEL RIFT', W / 2, 7.4 * u, u * 1.7, (0.48, 1, 0.78, 1), 'c', True)
+                  s.txt('A 4-player co-op adventure over local Wi-Fi', W / 2, 6.45 * u, u * 0.4, (1, 1, 1, 1))
+                  for i in range(4):
+                      bob = 0.12 * u * math.sin(s.t * 3 + i)
+                      s.spr_scr('hero%d_idle_R' % i, W / 2 + (i - 2) * 1.7 * u + 0.35 * u,
+                                4.6 * u + bob, 1.2 * u, 1.6 * u)
+                  s.button('host', 'HOST GAME', W / 2 - 3 * u, 2.9 * u, 6 * u, 1.3 * u)
+                  s.button('join', 'JOIN GAME', W / 2 - 3 * u, 1.4 * u, 6 * u, 1.3 * u, (0.5, 0.3, 0.8, 1))
+                  s.button('quit', 'QUIT', W - 3.2 * u, 0.3 * u, 2.8 * u, 1.0 * u, (0.6, 0.2, 0.25, 1), u * 0.4)
+
+              def draw_host(s):
+                  W, H = Window.size
+                  u = H / 9.0
+                  s.bg_menu()
+                  s.txt('HOST GAME', W / 2, 8.0 * u, u * 0.85, (0.48, 1, 0.78, 1), 'c', True)
+                  if NET.status == 'failed':
+                      s.txt(NET.msg, W / 2, 5.5 * u, u * 0.45, (1, 0.3, 0.3, 1))
+                  else:
+                      s.txt('Tell the others to tap JOIN and type this address:', W / 2, 6.8 * u, u * 0.42)
+                      s.txt(NET.ip, W / 2, 5.5 * u, u * 1.5, (1, 0.88, 0.29, 1), 'c', True)
+                      s.txt('Players connected: %d / %d' % (NET.count(), MAX_PLAYERS),
+                            W / 2, 4.4 * u, u * 0.42, (1, 1, 1, 1))
+                      for i, slot in enumerate(sorted(NET.names)):
+                          nm = SPEAKERS[slot][0] + ('  (you - host)' if slot == 0 else '  (%s)' % NET.names[slot])
+                          s.txt(nm, W / 2, (3.8 - i * 0.5) * u, u * 0.4, c3(PCOL[SLOT_COL[slot]]), 'c', True)
+                  s.button('start', 'START', W / 2 - 3 * u, 0.5 * u, 6 * u, 1.4 * u,
+                           (0.2, 0.7, 0.3, 1) if NET.status == 'hosting' else (0.3, 0.3, 0.3, 1))
+                  s.button('back', 'BACK', 0.5 * u, 0.5 * u, 3 * u, 1.2 * u, (0.6, 0.2, 0.25, 1), u * 0.45)
+
+              def draw_join(s):
+                  W, H = Window.size
+                  u = H / 9.0
+                  s.bg_menu()
+                  s.txt('JOIN GAME', 0.8 * u, H - 0.9 * u, u * 0.8, (0.48, 1, 0.78, 1), 'l', True)
+                  s.txt('Host address (shown on the host phone):', 0.8 * u, H - 2.0 * u, u * 0.4, (1, 1, 1, 1), 'l')
+                  bw = min(W * 0.5, 11 * u)
+                  s.box(0.8 * u, H - 3.7 * u, bw, 1.4 * u, (0, 0, 0, 0.7), u * 0.15)
+                  cur = '_' if int(s.t * 2) % 2 == 0 else ' '
+                  s.txt(s.ip + cur, 1.1 * u, H - 3.0 * u, u * 0.9, (1, 0.88, 0.29, 1), 'l', True)
+                  col = (1, 0.3, 0.3, 1) if NET.status in ('failed', 'lost') else (1, 1, 1, 1)
+                  s.txt(NET.msg or 'Hotspot host? Usually 192.168.43.1', 0.8 * u, H - 4.5 * u, u * 0.38, col, 'l')
+                  s.button('connect', 'CONNECT', 0.8 * u, 2.6 * u, 6 * u, 1.5 * u, (0.2, 0.7, 0.3, 1))
+                  s.button('back', 'BACK', 0.8 * u, 0.5 * u, 3 * u, 1.2 * u, (0.6, 0.2, 0.25, 1), u * 0.45)
+                  ks, gap = 1.6 * u, 0.15 * u
+                  kx0 = W - 3 * (ks + gap) - 0.5 * u
+                  rows = [['1', '2', '3'], ['4', '5', '6'], ['7', '8', '9'], ['.', '0', 'del']]
+                  for r, row in enumerate(rows):
+                      for c, k in enumerate(row):
+                          s.button('k' + k, 'DEL' if k == 'del' else k, kx0 + c * (ks + gap),
+                                   H - 1.0 * u - ks - r * (ks + gap), ks, ks, (0.25, 0.25, 0.4, 1), u * 0.6)
+
+              # ---------- game ----------
+              def draw_world(s):
+                  w = s.world
+                  sc = s.sc
+                  W, H = Window.size
+                  for key, par in (('bg_far', 0.12), ('bg_mid', 0.4)):
+                      off = int(s.cam * par) % VIEW_W
+                      Color(1, 1, 1, 1)
+                      for k in (0, 1):
+                          Rectangle(texture=SPR[key], pos=(s.ox + (k * VIEW_W - off) * sc, s.oy),
+                                    size=(VIEW_W * sc, VIEW_H * sc))
+                  t0 = max(0, int(s.cam // TILE) - 1)
+                  t1 = min(LEVEL_W, int((s.cam + VIEW_W) // TILE) + 2)
+                  Color(1, 1, 1, 1)
+                  for ty in range(LEVEL_H):
+                      for tx in range(t0, t1):
+                          k = w.tile_key(tx, ty)
+                          if k:
+                              Rectangle(texture=SPR[k], pos=(s.gx(tx * TILE), s.gy(ty * TILE, TILE)),
+                                        size=(TILE * sc, TILE * sc))
+                  for key, x, y, ww, hh, a in w.sprites(s.cam):
+                      s.spr(key, x, y, ww, hh, a)
+                  BlendFunc(sfactor='src_alpha', dfactor='one')
+                  for key, x, y in w.lights(s.cam):
+                      s.spr(key, x - 16, y - 16, 32, 32, 0.9)
+                  BlendFunc(sfactor='src_alpha', dfactor='one_minus_src_alpha')
+                  for x, y, vx, vy, life, col in w.parts:
+                      Color(*c3(PCOL.get(col, PCOL['white']), min(1.0, life * 3)))
+                      Rectangle(pos=(s.gx(x), s.gy(y, 2)), size=(2 * sc, 2 * sc))
+                  for x, y, bw, fr, key, name in w.bars(s.cam):
+                      px, py = s.gx(x), s.gy(y, 2)
+                      if px < -50 or px > W + 50:
+                          continue
+                      Color(0, 0, 0, 0.8)
+                      Rectangle(pos=(px - 1, py - 1), size=(bw * sc + 2, 2 * sc + 2))
+                      col = (1, 0.2, 0.2, 1) if key == 'r' else c3(PCOL[SLOT_COL[int(key[1])]])
+                      Color(*col)
+                      Rectangle(pos=(px, py), size=(max(0.0, bw * fr) * sc, 2 * sc))
+                      if name:
+                          s.txt(name, px + bw * sc / 2, py + 4 * sc, sc * 2.6, col)
+                  for x, y, val, code, life in w.texts:
+                      c = TXT_COL.get(code, (1, 1, 1))
+                      size = sc * (4.6 if code == 'y' else 3.4)
+                      s.txt(val, s.gx(x), s.gy(y, 0), size, (c[0], c[1], c[2], min(1.0, life * 2)), 'c', True)
+                  # hide everything outside the pixel view
+                  Color(0, 0, 0, 1)
+                  Rectangle(pos=(0, 0), size=(s.ox, H))
+                  Rectangle(pos=(s.ox + VIEW_W * sc, 0), size=(W - s.ox - VIEW_W * sc + 1, H))
+                  Rectangle(pos=(0, 0), size=(W, s.oy))
+                  Rectangle(pos=(0, s.oy + VIEW_H * sc), size=(W, H - s.oy - VIEW_H * sc + 1))
+
+              def draw_controls(s, pr):
+                  u = Window.height / 9.0
+                  for name, x, y, w, h, lab in s.ctl_rects():
+                      s.box(x, y, w, h, (1, 1, 1, 0.38 if name in pr else 0.15), u * 0.3)
+                      s.txt(lab, x + w / 2, y + h / 2, u * (0.8 if len(lab) < 2 else 0.4),
+                            (1, 1, 1, 0.9), 'c', True)
+
+              def draw_hud(s):
+                  w = s.world
+                  W, H = Window.size
+                  u = H / 9.0
+                  pw = W / 4.0
+                  for slot in range(MAX_PLAYERS):
+                      p = w.players.get(slot)
+                      if p is None:
+                          continue
+                      x, y = slot * pw + 0.1 * u, H - 1.5 * u
+                      col = c3(PCOL[SLOT_COL[slot]])
+                      s.box(x, y, pw - 0.2 * u, 1.4 * u, col[:3] + (0.9,), u * 0.15)
+                      s.box(x + 3, y + 3, pw - 0.2 * u - 6, 1.4 * u - 6, (0.04, 0.05, 0.12, 0.85), u * 0.12)
+                      s.spr_scr('hero%d_idle_R' % slot, x + 0.2 * u, y + 0.12 * u, 0.9 * u, 1.2 * u,
+                                1.0 if p.alive else 0.35)
+                      bx, bw = x + 1.3 * u, pw - 1.7 * u
+                      s.txt(p.name, bx, y + 1.12 * u, u * 0.36, col, 'l', True)
+                      fr = clamp(p.hp / float(max(1, p.mhp)), 0.0, 1.0)
+                      s.box(bx, y + 0.62 * u, bw, 0.24 * u, (0, 0, 0, 0.9))
+                      s.box(bx, y + 0.62 * u, bw * fr, 0.24 * u, (0.9, 0.2, 0.2, 1))
+                      s.txt('%d/%d' % (p.hp, p.mhp), bx + bw / 2, y + 0.74 * u, u * 0.2, (1, 1, 1, 1), 'c', False, False)
+                      s.box(bx, y + 0.4 * u, bw, 0.14 * u, (0, 0, 0, 0.9))
+                      s.box(bx, y + 0.4 * u, bw * clamp(p.mana / 100.0, 0.0, 1.0), 0.14 * u, (0.3, 0.7, 1, 1))
+                      s.txt('%d' % p.coins, bx, y + 0.17 * u, u * 0.28, (1, 0.88, 0.29, 1), 'l', True)
+                      if not p.alive:
+                          s.txt('DOWN', x + pw / 2 - 0.1 * u, y + 0.7 * u, u * 0.6, (1, 0.3, 0.3, 1), 'c', True)
+                  b = w.boss
+                  if b is not None and b.awake and b.alive:
+                      bx, by, bw, bh = max(0, s.ox) + 0.3 * u, 3.0 * u, 0.55 * u, 3.9 * u
+                      s.box(bx - 4, by - 4, bw + 8, bh + 8, (0.55, 0.35, 0.1, 1), u * 0.12)
+                      s.box(bx, by, bw, bh, (0.1, 0.02, 0.03, 1))
+                      s.box(bx, by, bw, bh * clamp(b.hp / float(max(1, b.mhp)), 0.0, 1.0), (0.85, 0.1, 0.1, 1))
+                      s.txt('THORNROOT', bx + bw / 2 + 0.4 * u, by + bh + 0.3 * u, u * 0.28, (1, 0.6, 0.3, 1), 'l', True)
+
+              def draw_dialogue(s):
+                  d = s.story.visible()
+                  W, H = Window.size
+                  u = H / 9.0
+                  st = s.story
+                  if d:
+                      bx, bw, by, bh = 4.8 * u, W - 9.6 * u, 0.3 * u, 2.6 * u
+                      col = c3(PCOL[d['color']])
+                      s.box(bx - 3, by - 3, bw + 6, bh + 6, col, u * 0.2)
+                      s.box(bx, by, bw, bh, (0.05, 0.04, 0.12, 0.92), u * 0.18)
+                      tx = bx + 0.4 * u
+                      if d['portrait']:
+                          ph = 1.9 * u
+                          pw2 = ph if d['portrait'].startswith('boss') else ph * 0.75
+                          s.spr_scr(d['portrait'], bx + 0.3 * u, by + 0.35 * u, pw2, ph)
+                          tx = bx + 2.5 * u
+                      s.txt(d['name'], tx, by + bh - 0.45 * u, u * 0.45, col, 'l', True)
+                      wd = int(bx + bw - tx - 0.3 * u)
+                      key = (d['text'], wd)
+                      if key != s.dlg_key:
+                          lb = CoreLabel(text=d['text'] or ' ', font_size=int(u * 0.4),
+                                         text_size=(wd, None), halign='left')
+                          lb.refresh()
+                          s.dlg_tex = lb.texture
+                          s.dlg_key = key
+                      t = s.dlg_tex
+                      Color(1, 1, 1, 1)
+                      Rectangle(texture=t, pos=(tx, by + bh - 0.85 * u - t.height), size=t.size)
+                      if d['done']:
+                          s.txt('>>', bx + bw - 0.5 * u, by + 0.4 * u, u * 0.4, (1, 1, 1, 0.6 + 0.4 * math.sin(s.t * 8)))
+                  if st.banner:
+                      a = min(1.0, st.banner[1])
+                      s.box(0, H * 0.62 - 0.8 * u, W, 1.6 * u, (0, 0, 0, 0.55 * a))
+                      s.txt(st.banner[0], W / 2, H * 0.62, u * 0.75, (1, 0.88, 0.4, a), 'c', True)
+
+              def draw_end(s, title, col):
+                  W, H = Window.size
+                  u = H / 9.0
+                  s.box(0, 0, W, H, (0, 0, 0, 0.65))
+                  s.txt(title, W / 2, H * 0.64, u * 1.7, col, 'c', True)
+                  coins = sum(p.coins for p in s.world.players.values())
+                  s.txt('Team coins: %d' % coins, W / 2, H * 0.48, u * 0.5, (1, 0.88, 0.29, 1))
+                  s.button('menu', 'MAIN MENU', W / 2 - 3 * u, H * 0.25, 6 * u, 1.4 * u)
+
+              def draw_game(s):
+                  w = s.world
+                  W, H = Window.size
+                  u = H / 9.0
+                  s.draw_world()
+                  s.draw_controls(s.pressed())
+                  s.draw_hud()
+                  if s.toast:
+                      s.txt(s.toast[0], W / 2, H - 2.1 * u, u * 0.45, (1, 0.8, 0.3, min(1.0, s.toast[1])), 'c', True)
+                  s.draw_dialogue()
+                  if NET.role == 'client' and NET.status in ('lost', 'failed'):
+                      s.draw_end('CONNECTION LOST', (1, 0.4, 0.3, 1))
+                  elif w.over and not s.story.busy():
+                      if w.over == 'won':
+                          s.draw_end('VICTORY!', (0.48, 1, 0.78, 1))
+                      else:
+                          s.draw_end('DEFEAT', (1, 0.3, 0.3, 1))
+
+              def draw(s):
+                  W, H = Window.size
+                  s.sc = max(1, int(min(W / float(VIEW_W), H / float(VIEW_H))))
+                  s.ox = int((W - VIEW_W * s.sc) / 2)
+                  s.oy = int((H - VIEW_H * s.sc) / 2)
+                  s.btns = []
+                  s.canvas.clear()
+                  with s.canvas:
+                      if s.scr == 'game' and s.world is not None:
+                          s.draw_game()
+                      elif s.scr == 'host':
+                          s.draw_host()
+                      elif s.scr == 'join':
+                          s.draw_join()
+                      else:
+                          s.draw_menu()
+
+              # ---------- main loop ----------
+              def step_game(s, dt):
+                  w, st = s.world, s.story
+                  host = NET.role == 'host'
+                  for slot, p in w.players.items():
+                      p.name = SPEAKERS[slot][0]
+                  me = w.local_player()
+                  if me is not None:
+                      pr = s.pressed()
+                      me.inp = {'l': 'L' in pr, 'r': 'R' in pr, 'j': 'J' in pr,
+                                'a': 'A' in pr, 's': 'S' in pr}
+                  if host:
+                      w.update(dt)
+                      if not NET.clients:
+                          w.out = []
+                  else:
+                      w.update_client(dt)
+                  NET.tick(w, dt)
+                  st.feed(w)
+                  st.update(dt)
+                  tgt = me if (me is not None and me.alive) else None
+                  if tgt is None:
+                      al = [p for p in w.players.values() if p.alive]
+                      tgt = al[0] if al else None
+                  if tgt is not None:
+                      lo = w.lock_tx * TILE if w.lock_tx else 0
+                      want = clamp(tgt.x + 4 - VIEW_W / 2.0, lo, LEVEL_W * TILE - VIEW_W)
+                      if s.cam == 0.0 and s.t < 1e9 and abs(want - s.cam) > 200:
+                          s.cam = want
+                      s.cam += (want - s.cam) * min(1.0, dt * 6)
+                  if w.shake > 0:
+                      k = int(min(3, 1 + w.shake * 0.4))
+                      s.shx, s.shy = random.randint(-k, k), random.randint(-k, k)
+                  else:
+                      s.shx = s.shy = 0
+
+              def loop(s, dt):
+                  dt = min(dt, 0.1)
+                  s.t += dt
+                  NET.poll(s.world if s.scr == 'game' else None)
+                  if s.toast:
+                      s.toast[1] -= dt
+                      if s.toast[1] <= 0:
+                          s.toast = None
+                  while NET.events:
+                      ev = NET.events.pop(0)
+                      if ev.startswith('left:'):
+                          s.toast = [ev[5:] + ' left the game', 3.0]
+                  if s.scr == 'join' and NET.started and NET.status == 'connected':
+                      s.begin_game()
+                  if s.scr == 'game' and s.world is not None:
+                      s.step_game(dt)
+                  s.draw()
+
+          class PixelRiftApp(App):
+              title = 'Pixel Rift'
+              def build(s):
+                  Window.clearcolor = (0, 0, 0, 1)
+                  build_sprites()
+                  return Game()
+              def on_pause(s):
+                  return True
+              def on_stop(s):
+                  NET.stop()
+
+          if __name__ == '__main__':
+              PixelRiftApp().run()
+          # ===================== END OF main.py =====================
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf automake libtool libltdl-dev pkg-config zlib1g-dev libncurses-dev libffi-dev libssl-dev build-essential ccache cmake
+
+      - name: Install Buildozer
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install buildozer cython==0.29.36 virtualenv
+
+      - name: Cache Buildozer
+        uses: actions/cache@v4
+        with:
+          path: |
+            game/.buildozer
+            ~/.buildozer
+          key: buildozer-${{ hashFiles('game/buildozer.spec') }}-v1
+
+      - name: Build APK
+        working-directory: game
+        run: |
+          yes | buildozer -v android debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelRift-APK
+          path: game/bin/*.apk
